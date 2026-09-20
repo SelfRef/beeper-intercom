@@ -87,6 +87,8 @@ func (b *Bridge) reconcileRooms(ctx context.Context) error {
 	networkAvatar, err := b.uploadFile(ctx, b.conf().Network.Avatar)
 	if err != nil {
 		b.log.Warn().Err(err).Msg("Failed to upload network avatar")
+	} else if !networkAvatar.IsEmpty() {
+		_ = b.store.SetKV(ctx, kvNetworkAvatar, networkAvatar.String())
 	}
 
 	for _, key := range config.SortedKeys(b.conf().Rooms) {

@@ -228,14 +228,26 @@ func (o *openWebUI) sendOneShot(ctx context.Context, conv Conversation, turn Tur
 	return &Reply{Text: text, Parent: assistantID, Link: o.Link(conv.ID)}, nil
 }
 
-// sendStreaming runs the turn as Open WebUI's background task and polls the
-// chat for the growing answer. The HTTP request itself blocks until the task
-// is done and returns nothing useful, so it runs in the background and only
-// its error matters.
+// sendStreaming runs the turn as Open WebUI's background task. The HTTP
+// request itself blocks until the task is done and returns nothing useful, so
+// it runs in the background and only its error matters; the deltas come from
+// the user's socket.io room when a session token is configured, and from
+// polling the chat otherwise (which, on 0.11.3, only ever sees the finished
+// answer — see socketio.go).
 func (o *openWebUI) sendStreaming(ctx context.Context, conv Conversation, turn Turn, sink Sink) (*Reply, error) {
 	assistantID := uuid.NewString()
 	if sink.Status != nil {
 		sink.Status("thinking")
+	}
+
+	if token := o.cfg.SocketToken(); token != "" {
+		socket, err := dialOWUISocket(ctx, o.cfg.URL, token)
+		if err != nil {
+			o.log.Warn().Err(err).Msg("Socket.io unavailable; falling back to polling")
+		} else {
+			defer socket.Close()
+			return o.streamViaSocket(ctx, socket, conv, turn, assistantID, sink)
+		}
 	}
 
 	requestDone := make(chan error, 1)
@@ -306,6 +318,103 @@ func (o *openWebUI) sendStreaming(ctx context.Context, conv Conversation, turn T
 		text = "*No answer — the model returned only its reasoning.*"
 	}
 	return &Reply{Text: text, Parent: assistantID, Link: o.Link(conv.ID)}, nil
+}
+
+// streamViaSocket consumes the turn's events from the socket: text deltas as
+// they are generated, and the terminal chat:completion. Reasoning deltas are
+// skipped — they are the model thinking, not the answer.
+func (o *openWebUI) streamViaSocket(ctx context.Context, socket *owuiSocket, conv Conversation, turn Turn, assistantID string, sink Sink) (*Reply, error) {
+	requestDone := make(chan error, 1)
+	go func() {
+		requestDone <- o.do(ctx, http.MethodPost, "/api/chat/completions", o.turnRequest(conv, turn, assistantID, true), nil)
+	}()
+
+	var text strings.Builder
+	var acc accumulator
+	done := make(chan error, 1)
+	go func() {
+		done <- socket.events(ctx, func(name string, payload json.RawMessage) bool {
+			if name != "events" {
+				return true
+			}
+			var evt owuiEvent
+			if json.Unmarshal(payload, &evt) != nil || evt.MessageID != assistantID {
+				return true
+			}
+			var inner owuiDelta
+			_ = json.Unmarshal(evt.Data.Data, &inner)
+			switch evt.Data.Type {
+			case "response:completion":
+				if strings.HasSuffix(inner.Type, "output_text.delta") && inner.Delta != "" {
+					if sink.Status != nil && text.Len() == 0 {
+						sink.Status("generating")
+					}
+					text.WriteString(inner.Delta)
+					acc.seen = text.String()
+					sink.Delta(inner.Delta)
+				}
+			case "chat:completion":
+				// The non-delta path carries the whole content so far.
+				var content string
+				if json.Unmarshal(inner.Content, &content) == nil && content != "" {
+					if delta, ok := acc.delta(StripDetails(content)); ok {
+						text.WriteString(delta)
+						sink.Delta(delta)
+					}
+				}
+				if inner.Done {
+					return false
+				}
+			case "chat:message:error":
+				return false
+			}
+			return true
+		})
+	}()
+
+	var requestErr error
+	requestFinished := false
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case requestErr = <-requestDone:
+			if requestErr != nil {
+				return nil, requestErr
+			}
+			requestFinished = true
+			// The task is over; the terminal event is at most a moment behind.
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		case err := <-done:
+			if err != nil && !requestFinished {
+				o.log.Debug().Err(err).Msg("Socket ended before the request; waiting for the request")
+				if err := <-requestDone; err != nil {
+					return nil, err
+				}
+			}
+		}
+		break
+	}
+
+	// The stored message is authoritative: it is what the web UI shows and
+	// what the next turn replays.
+	final := text.String()
+	if msg, err := o.assistantMessage(ctx, conv.ID, assistantID); err == nil && msg != nil {
+		if msg.Error != "" {
+			return nil, fmt.Errorf("open webui: %s", msg.Error)
+		}
+		if visible := StripDetails(msg.Content); visible != "" {
+			final = visible
+		} else if final == "" && strings.Contains(msg.Content, "<details") {
+			final = "*No answer — the model returned only its reasoning.*"
+		}
+	}
+	return &Reply{Text: final, Parent: assistantID, Link: o.Link(conv.ID)}, nil
 }
 
 // chatMessage is the slice of a stored message the streaming loop reads.

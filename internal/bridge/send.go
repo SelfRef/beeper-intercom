@@ -119,7 +119,12 @@ func (b *Bridge) sendText(ctx context.Context, roomID id.RoomID, ghostKey, body,
 		content.FormattedBody = formatted
 	}
 	if opts.MentionRoom {
-		content.Mentions = &event.Mentions{Room: true}
+		// Hungryserv does not evaluate .m.rule.is_room_mention at all (verified
+		// 2026-09-20: an @room from a PL-75 ghost never raised highlight_count,
+		// muted or not), so an "urgent" alert mentions the account owner by
+		// name. That rule does fire, and it fires THROUGH a muted room — which
+		// is the whole point of marking something urgent.
+		content.Mentions = &event.Mentions{Room: true, UserIDs: []id.UserID{b.userID}}
 	}
 	if opts.Profile != nil {
 		content.BeeperPerMessageProfile = &event.BeeperPerMessageProfile{

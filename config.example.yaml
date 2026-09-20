@@ -71,7 +71,10 @@ rooms:
     topic: Things that want attention now.
     kind: broadcast
     ghosts: [alerts]
-    # priority high/urgent becomes an @room mention in this room only.
+    # priority high/urgent mentions you by name in this room only — and a
+    # mention notifies even when the room is muted, which is the point: mute
+    # Alerts, let the urgent ones through. (Beeper never fires @room, so the
+    # mention is explicit.)
     urgent_mentions: true
 
   chat:
@@ -90,6 +93,10 @@ agents:
     type: openwebui
     url: http://openwebui:8080
     api_key_env: OWUI_API_KEY
+    # Optional session JWT (not the API key) for the socket.io room, which is
+    # where Open WebUI emits a running turn's tokens. Without it answers still
+    # arrive, just not token by token. See the README.
+    socket_token_env: OWUI_SOCKET_TOKEN
     model: my-model
     # Created if missing; keeps bridge chats out of the main sidebar.
     folder: Intercom

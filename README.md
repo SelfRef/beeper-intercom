@@ -105,7 +105,7 @@ curl -X POST http://intercom:8080/v1/notify \
 | `room` | a room key from your config (or a raw `!room` ID the bridge owns) |
 | `ghost` | which identity speaks; defaults to the room's first |
 | `title` / `text` / `html` | bold first line; body as Markdown; or HTML as given |
-| `priority` | `min`…`urgent`; `high` and above become an `@room` mention in a room with `urgent_mentions` |
+| `priority` | `min`…`urgent`; `high` and above mention the account owner in a room with `urgent_mentions`, which notifies **even if the room is muted** (Beeper never fires the `@room` rule, so the mention is by name) |
 | `url` | rendered as a link after the body |
 | `tags` | known ntfy shortcodes become emoji, the rest become hashtags |
 | `media` | downloaded and re-uploaded, so the client never reaches into your network |
@@ -214,6 +214,23 @@ Note on Open WebUI: the bridge needs `ENABLE_API_KEYS=true` and an API key for
 the account whose chats, tools and memory you want the agent to use. The chats
 land in that account's sidebar, in the folder named in `folder:`.
 
+For live streaming from Open WebUI it also needs a **session JWT** in
+`socket_token_env`. A streaming request against a saved chat runs as a
+background task whose tokens are only emitted on the user's socket.io room,
+and that socket verifies tokens with the session secret, so the API key does
+not open it. Mint one inside the container:
+
+```sh
+docker compose exec openwebui python -c "from open_webui.utils.auth import create_token; \
+  print(create_token(data={'id': '<your user id>'}, expires_delta=None))"
+```
+
+It is a full session for that user — same blast radius as the API key — and
+is revoked by a password change or an OIDC back-channel logout. Without it the
+bridge falls back to polling, which on 0.11.3 only ever sees the finished
+answer (the partial-output overlay is keyed by a task id the server never
+records), so the bubble fills in one go.
+
 ## Making notifications actionable
 
 **Reactions are commands.** A notification may declare `actions` mapping a
@@ -284,6 +301,10 @@ config renames the room rather than creating a second one.
 
 - `broadcast` — the composer is locked (`events_default` is set *above* your
   own power level; equal is not enough) and `m.reaction` stays at 0.
+- `urgent_mentions: true` — `priority: high/urgent` mentions you by name. The
+  intended use is a muted room: routine alerts stay quiet, urgent ones still
+  buzz. (Hungryserv evaluates `.m.rule.is_user_mention` but not
+  `.m.rule.is_room_mention`, so `@room` alone would do nothing.)
 - `chat` — an ordinary conversational room.
 - `dm` — the same, rendered as a direct message. Needs exactly one ghost.
 

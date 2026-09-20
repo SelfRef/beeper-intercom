@@ -150,9 +150,15 @@ type Agent struct {
 	// set, and any direct tool servers the room may reach. ToolServers is
 	// passed through verbatim, because Open WebUI wants whole server objects
 	// (url, auth, spec) there rather than names.
-	Folder      string           `yaml:"folder"`
-	ToolIDs     []string         `yaml:"tool_ids"`
-	ToolServers []map[string]any `yaml:"tool_servers"`
+	//
+	// SocketTokenEnv names a SESSION JWT for the user, used only for the
+	// socket.io connection that carries live deltas — the socket verifies
+	// tokens with the session secret, so the API key is refused there.
+	// Without it answers still arrive, just not token by token.
+	SocketTokenEnv string           `yaml:"socket_token_env"`
+	Folder         string           `yaml:"folder"`
+	ToolIDs        []string         `yaml:"tool_ids"`
+	ToolServers    []map[string]any `yaml:"tool_servers"`
 
 	// openai: the bridge keeps the transcript, so it needs to know how much of
 	// it to replay and what to put in front of it.
@@ -495,6 +501,14 @@ func (a Agent) Key() string {
 		}
 	}
 	return a.APIKey
+}
+
+// SocketToken returns the session JWT for the socket, if configured.
+func (a Agent) SocketToken() string {
+	if a.SocketTokenEnv == "" {
+		return ""
+	}
+	return os.Getenv(a.SocketTokenEnv)
 }
 
 // GhostForRoom returns the ghost a notification should speak as: the one it

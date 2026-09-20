@@ -22,9 +22,10 @@ import (
 	"github.com/beeper/bridge-manager/api/beeperapi"
 	"github.com/beeper/bridge-manager/api/hungryapi"
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/jsontime"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
-	"maunium.net/go/mautrix/beeperstream"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -39,6 +40,7 @@ const (
 	kvUserID        = "user_id"
 	kvUsername      = "username"
 	kvAvatarPrefix  = "avatar:"
+	kvNetworkAvatar = "network_avatar"
 )
 
 // Handlers are what the service layer wants to hear about. Everything else
@@ -144,7 +146,7 @@ func New(cfg *config.Config, st *store.Store, log zerolog.Logger, handlers Handl
 		roomIDs:  map[string]id.RoomID{},
 		roomKey:  map[id.RoomID]string{},
 		ghosts:   map[string]id.UserID{},
-		streams:  streamer{helpers: map[string]*beeperstream.Helper{}},
+		streams:  streamer{streams: map[streamKey]*streamState{}, devices: map[string]id.DeviceID{}},
 	}
 	b.cfg.Store(cfg)
 	return b
@@ -193,11 +195,16 @@ func (b *Bridge) Start(ctx context.Context) error {
 	ep.On(event.EventReaction, b.handleReaction)
 	ep.On(event.EventRedaction, b.handleRedaction)
 	ep.On(eventPollResponse, b.handlePollResponse)
+	// Stream subscriptions are handled by the beeperstream helpers; this only
+	// makes their arrival visible at debug level, because a subscribe that is
+	// delivered but not acted on is otherwise invisible.
+	ep.On(event.ToDeviceBeeperStreamSubscribe, b.handleStreamSubscribe)
 	ep.Start(ctx)
 
 	ready := make(chan struct{})
 	var once sync.Once
 	go b.websocketLoop(ctx, func() { once.Do(func() { close(ready) }) })
+	go b.loginStateLoop(ctx)
 
 	select {
 	case <-ready:
@@ -229,7 +236,11 @@ func (b *Bridge) websocketLoop(ctx context.Context, onConnect func()) {
 			b.mu.Unlock()
 			backoff = time.Second
 			b.log.Info().Msg("Appservice websocket connected")
-			b.postBridgeState(ctx, status.StateConnected, "")
+			// RUNNING, not CONNECTED: Beeper's bridge list treats CONNECTED as a
+			// per-login state and left this bridge at STARTING (from the
+			// registration call) until RUNNING was posted — verified 2026-09-20
+			// against the ten bbctl bridges, which all sit at RUNNING.
+			b.postBridgeState(ctx, status.StateRunning, "")
 			if reconnect {
 				b.Status(ctx, fmt.Sprintf("Reconnected to Beeper after %s.", gap))
 			}
@@ -317,12 +328,15 @@ func (b *Bridge) loadOrRegister(ctx context.Context) error {
 	}
 	b.log.Info().Str("bridge", b.conf().Network.Bridge).Str("id", b.reg.ID).
 		Str("user", b.userID.String()).Msg("Registered appservice")
-	b.postBridgeState(ctx, status.StateStarting, "SELF_HOST_REGISTERED")
+	// bbctl posts RUNNING for a register-created (typeless) bridge; STARTING is
+	// for typed bridges that still have to log in, and it never clears on its
+	// own.
+	b.postBridgeState(ctx, status.StateRunning, "SELF_HOST_REGISTERED")
 	return nil
 }
 
 // postBridgeState tells Beeper the bridge is alive, which is what keeps it
-// from being shown as broken in the client's account list.
+// from being shown as broken in the client's bridge list.
 func (b *Bridge) postBridgeState(ctx context.Context, state status.BridgeStateEvent, reason string) {
 	if b.reg == nil || b.username == "" {
 		return
@@ -335,6 +349,69 @@ func (b *Bridge) postBridgeState(ctx context.Context, state status.BridgeStateEv
 		})
 	if err != nil {
 		b.log.Debug().Err(err).Msg("Failed to post bridge state")
+	}
+	b.postLoginState(ctx)
+}
+
+// loginStateTTL is how long Beeper trusts a login state before it wants to
+// hear from the bridge again; mautrix bridges refresh at half the TTL.
+const loginStateTTL = time.Hour
+
+// postLoginState is the second half of "being a network": Beeper's sidebar
+// lists a bridge's ACCOUNTS (logins), each described by a bridge state that
+// carries remote_id / remote_name / remote_profile. A bridge with only the
+// bridge-level RUNNING is connected but has no account to show, so the
+// network stays out of the list. This bridge has exactly one "login": the
+// network itself.
+func (b *Bridge) postLoginState(ctx context.Context) {
+	if b.reg == nil || b.username == "" {
+		return
+	}
+	cfg := b.conf()
+	state := &status.BridgeState{
+		StateEvent: status.StateConnected,
+		Timestamp:  jsontime.UnixNow(),
+		TTL:        int(loginStateTTL.Seconds()),
+		Source:     "bridge",
+		UserID:     b.userID,
+		RemoteID:   networkid.UserLoginID(cfg.Network.ID),
+		RemoteName: cfg.Network.Name,
+		RemoteProfile: status.RemoteProfile{
+			Name:     cfg.Network.Name,
+			Username: cfg.Network.ID,
+		},
+		Info: map[string]any{"is_self_hosted": true},
+	}
+	if avatar, err := b.store.GetKV(ctx, kvNetworkAvatar); err == nil && avatar != "" {
+		state.RemoteProfile.Avatar = id.ContentURIString(avatar)
+	}
+	// Over the appservice websocket, the way every mautrix bridge on Beeper
+	// does it: the REST endpoint bbctl uses only knows bridge-level states
+	// and rejects CONNECTED ("Unknown state CONNECTED"); per-login states are
+	// `bridge_status` websocket commands, and they are what fills the
+	// account list.
+	if b.as == nil || !b.as.HasWebsocket() {
+		return
+	}
+	if err := b.as.SendWebsocket(ctx, &appservice.WebsocketRequest{Command: "bridge_status", Data: state}); err != nil {
+		b.log.Debug().Err(err).Msg("Failed to send login state")
+	}
+}
+
+// loginStateLoop refreshes the login state while connected, so the account
+// never ages out of the sidebar.
+func (b *Bridge) loginStateLoop(ctx context.Context) {
+	ticker := time.NewTicker(loginStateTTL / 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if b.Connected() {
+				b.postLoginState(ctx)
+			}
+		}
 	}
 }
 
