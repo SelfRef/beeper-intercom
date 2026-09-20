@@ -263,8 +263,11 @@ action survives the receiver being restarted. `GET /v1/deliveries` and
 ## The status room
 
 Name one with `network.status_room` and the bridge creates a bridge-bot room
-where it reports on itself: startup, reconnects after a drop, config reloads,
-deliveries that gave up. These render as the dim centred notices Beeper uses
+where it reports on itself: startup, outages longer than a minute, config
+reloads, deliveries that gave up. Shorter drops are not reported: the
+appservice websocket is pinged every 180 s to stop the homeserver closing it
+as idle, and the reconnects that still happen take about a second, during
+which inbound events are buffered by the server rather than lost. These render as the dim centred notices Beeper uses
 for bridge login prompts — that style needs both the room flag
 (`com.beeper.is_bridge_bot_room`) and the bridge bot as sender, so nothing
 else in the bridge can use it and the room never turns into a chat.

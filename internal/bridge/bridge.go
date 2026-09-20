@@ -205,6 +205,7 @@ func (b *Bridge) Start(ctx context.Context) error {
 	var once sync.Once
 	go b.websocketLoop(ctx, func() { once.Do(func() { close(ready) }) })
 	go b.loginStateLoop(ctx)
+	go b.pingLoop(ctx, pingInterval, pingTimeout)
 
 	select {
 	case <-ready:
@@ -241,8 +242,13 @@ func (b *Bridge) websocketLoop(ctx context.Context, onConnect func()) {
 			// registration call) until RUNNING was posted — verified 2026-09-20
 			// against the ten bbctl bridges, which all sit at RUNNING.
 			b.postBridgeState(ctx, status.StateRunning, "")
-			if reconnect {
+			// Only report outages worth reporting. Beeper recycles sockets
+			// routinely and the reconnect takes about a second; a notice for
+			// every one of those is noise in the bot room, not status.
+			if reconnect && gap >= outageNoticeAfter {
 				b.Status(ctx, fmt.Sprintf("Reconnected to Beeper after %s.", gap))
+			} else if reconnect {
+				b.log.Debug().Dur("gap", gap).Msg("Reconnected after a short gap, not reporting")
 			}
 			onConnect()
 		})
@@ -356,6 +362,64 @@ func (b *Bridge) postBridgeState(ctx context.Context, state status.BridgeStateEv
 // loginStateTTL is how long Beeper trusts a login state before it wants to
 // hear from the bridge again; mautrix bridges refresh at half the TTL.
 const loginStateTTL = time.Hour
+
+const (
+	// pingInterval is how often we send a `ping` command over the appservice
+	// websocket. hungryserv closes a socket that has been silent for around
+	// five minutes, so a bridge that never pings reconnects all day; every
+	// bbctl-generated config in this stack sets ping_interval_seconds: 180,
+	// and that is where this number comes from.
+	pingInterval = 180 * time.Second
+	// pingTimeout bounds one ping. A server that has not answered in this
+	// long is not going to; tearing the socket down is how the reconnect
+	// loop finds out.
+	pingTimeout = 10 * time.Second
+	// outageNoticeAfter is the shortest gap worth a notice in the bot room.
+	outageNoticeAfter = 60 * time.Second
+)
+
+// wsPing is the payload of the `ping` websocket command, matching what
+// mautrix bridges send (bridgev2/matrix/websocket.go).
+type wsPing struct {
+	Timestamp int64 `json:"timestamp"`
+}
+
+// pingLoop keeps the appservice websocket alive. Without it hungryserv drops
+// the connection as idle every few minutes: harmless in itself, because the
+// websocket loop reconnects, but it means a steady drip of reconnects and
+// every to-device subscriber has to re-subscribe after each one.
+func (b *Bridge) pingLoop(ctx context.Context, interval, timeout time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if b.as == nil || !b.as.HasWebsocket() {
+				continue
+			}
+			pingCtx, cancel := context.WithTimeout(ctx, timeout)
+			start := time.Now()
+			var resp wsPing
+			err := b.as.RequestWebsocket(pingCtx, &appservice.WebsocketRequest{
+				Command: "ping",
+				Data:    &wsPing{Timestamp: start.UnixMilli()},
+			}, &resp)
+			cancel()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				b.log.Warn().Err(err).Dur("duration", time.Since(start)).
+					Msg("Websocket ping failed, reconnecting")
+				b.as.StopWebsocket(fmt.Errorf("websocket ping failed: %w", err))
+				continue
+			}
+			b.log.Debug().Dur("duration", time.Since(start)).Msg("Websocket ping ok")
+		}
+	}
+}
 
 // postLoginState is the second half of "being a network": Beeper's sidebar
 // lists a bridge's ACCOUNTS (logins), each described by a bridge state that
