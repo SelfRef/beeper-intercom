@@ -139,6 +139,51 @@ func (b *Bridge) reconcileRooms(ctx context.Context) error {
 	return nil
 }
 
+// RecreateRoom points a config key at a brand new room and returns both, the
+// one left behind and the one created.
+//
+// It exists for the one thing redaction cannot undo. A message redacted before
+// the bridge learned to stamp `com.beeper.dont_render_redacted_placeholder`
+// keeps its tombstone for good — the key lives in the redaction event, and
+// re-redacting an already-redacted event has its content stripped (BEEPER_REF
+// §"Suppressing the tombstone"). A room carrying scars like that can only be
+// left, not cleaned, so /purge new-room leaves it.
+//
+// The old room is not touched: it keeps its history and its membership, and
+// simply stops being the portal. Forgetting the mapping is what makes the
+// reconciliation below build a new one, exactly as it would on a first start.
+func (b *Bridge) RecreateRoom(ctx context.Context, key string) (old, created id.RoomID, err error) {
+	if _, ok := b.conf().Rooms[key]; !ok {
+		return "", "", fmt.Errorf("no room called %q in the config", key)
+	}
+	b.mu.Lock()
+	old = b.roomIDs[key]
+	delete(b.roomIDs, key)
+	delete(b.roomKey, old)
+	b.mu.Unlock()
+
+	if err := b.store.ForgetRoomID(ctx, key); err != nil {
+		// Put the mapping back rather than leave the key pointing nowhere in
+		// memory while the database still names the old room.
+		b.mu.Lock()
+		b.roomIDs[key], b.roomKey[old] = old, key
+		b.mu.Unlock()
+		return old, "", err
+	}
+	// Reconciling everything rather than only this key: it is idempotent, and
+	// every other room is a hash comparison that changes nothing.
+	if err := b.reconcileRooms(ctx); err != nil {
+		return old, "", err
+	}
+	b.mu.RLock()
+	created = b.roomIDs[key]
+	b.mu.RUnlock()
+	if created == "" {
+		return old, "", fmt.Errorf("no room was created for %q", key)
+	}
+	return old, created, nil
+}
+
 func (b *Bridge) createRoom(ctx context.Context, key string, room config.Room, avatar, networkAvatar id.ContentURI) (id.RoomID, error) {
 	invite := []id.UserID{b.userID}
 	for _, ghost := range room.Ghosts {

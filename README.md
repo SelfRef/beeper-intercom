@@ -308,6 +308,30 @@ notices:
   format_commands: true  # rewrite your `/command` as inline code
 ```
 
+**Emptying the room.** `/clear` is about the bridge's own messages; `/purge` is
+about the room. It takes out every message in it — yours, the answers, the
+notices, the attachments, whoever sent them — and starts a new conversation,
+which is how a room that has drifted is put back to the state it was created
+in. Two steps, because there is no undo: `/purge` counts what it would remove
+and says so, `/purge yes` carries it out. State is left alone, so the room
+keeps its name, avatar, members and power levels and ends up empty rather than
+broken; so is the backend, whose copy of the conversations is still in its web
+UI. A room of announcements (`kind: broadcast`) is refused — what is in it is a
+record somebody else acts on — and so is a room with a turn still being
+answered, with `/stop` as the way out.
+
+Two things survive an empty room, and `/purge new-room` is the answer to both.
+A message deleted **before** the bridge started stamping
+`com.beeper.dont_render_redacted_placeholder` on its redactions keeps its
+*"This message has been deleted"* marker for good: the key lives in the
+redaction event, and redacting an already-redacted event has its content
+stripped, so it cannot be added afterwards. A client that has cached a poll
+goes on drawing the card after the poll event itself is gone. Neither exists in
+a room that never had them, so `/purge new-room` points the config key at a
+brand new room and leaves the old one whole — history, membership and all. It
+stops being written to, and deleting the chat is one action in the client and
+the owner's to take.
+
 **Deleting one of your own messages** does what deleting a message in the web
 UI does: it takes the answer with it. For a question already answered that
 means every event the answer occupies leaves the room and the exchange is
@@ -362,6 +386,7 @@ slash:
 | `/status` | room, agent, model and reasoning level, last turn's tokens and speed, tools, transport |
 | `/bridge [reload\|restart]` | operate the bridge from the room: `reload` re-reads the config file (rooms reconcile, ghosts refresh, conversations carry on), `restart` replaces the process — it stops the same way the runtime would stop it and whatever supervises it brings it back (`restart: unless-stopped`), then says so in the room that asked |
 | `/clear [all]` · `/clean` | remove the last bridge message, or every one in this conversation |
+| `/purge [yes\|new-room]` | empty this room: every message in it goes, whoever sent it, and the next message starts a new conversation — `/purge` counts first, `/purge yes` does it; state, and the backend's copy of the conversations, are left alone. `/purge new-room` leaves the room behind and builds a fresh one instead, for the marks redaction cannot reach |
 | `/help` | the list |
 
 A new conversation starts when you ask for one, when the current one has been

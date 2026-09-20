@@ -46,6 +46,7 @@ var helpText = "**Commands** — everything starting with `/` is handled here an
 		{"`/status`", "room, agent, model, context, tools, transport"},
 		{"`/bridge [reload restart]`", "re-read the config file, or restart the bridge itself"},
 		{"`/clear [all]` · `/clean`", "remove the last bridge message, or every one in this conversation"},
+		{"`/purge [yes new-room]`", "empty this room — every message in it — or leave it for a fresh one"},
 		{"`/help`", "this table"},
 	}) +
 	"\nReplying in a thread starts a side conversation; reacting to a notification runs its action."
@@ -134,6 +135,8 @@ func (s *Service) handleCommand(ctx context.Context, msg *bridge.Message, room c
 		reply = s.commandBridge(ctx, msg, room, args)
 	case "/clear", "/clean":
 		reply = s.commandClear(ctx, msg, room, args)
+	case "/purge":
+		reply = s.commandPurge(ctx, msg, room, args)
 	default:
 		reply = fmt.Sprintf("`%s` is not a command. `/help` for the list; `//%s` sends it as a message.",
 			command, strings.TrimPrefix(body, "/"))

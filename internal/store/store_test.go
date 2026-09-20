@@ -433,3 +433,131 @@ func TestCommandOrdering(t *testing.T) {
 		t.Errorf("thread should have no commands yet: %v (%v)", last, err)
 	}
 }
+
+// A purge takes one room's conversations and everything hanging off them, and
+// leaves every other room alone — including the media cache, which is shared.
+func TestPurgeRoom(t *testing.T) {
+	ctx := context.Background()
+	st := open(t)
+
+	seed := func(roomKey, convID string) int64 {
+		sess, err := st.CreateSession(ctx, &Session{RoomKey: roomKey, Agent: "main", ConvID: convID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AppendTranscript(ctx, convID, "user", "hello"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.PutTurn(ctx, &Turn{EventID: "$turn-" + roomKey, SessionID: sess.ID, Question: "hello"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.PutNotice(ctx, &Notice{EventID: "$notice-" + roomKey, RoomKey: roomKey, RoomID: "!" + roomKey}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.PutCommand(ctx, &Command{EventID: "$cmd-" + roomKey, RoomKey: roomKey, RoomID: "!" + roomKey, Body: "/status"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.PutNotification(ctx, &Notification{EventID: "$note-" + roomKey, RoomKey: roomKey, RoomID: "!" + roomKey, Ghost: "g"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.PutPoll(ctx, &Poll{EventID: "$poll-" + roomKey, RoomKey: roomKey, RoomID: "!" + roomKey, Question: "?"}); err != nil {
+			t.Fatal(err)
+		}
+		return sess.ID
+	}
+	kept := seed("other", "conv-other")
+	seed("chat", "conv-chat")
+	if err := st.PutMedia(ctx, "hash", &Media{MXC: "mxc://x/y"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.PurgeRoom(ctx, "chat"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Gone: the conversation and everything that pointed at it.
+	if live, err := st.LiveSession(ctx, "chat", ""); err != nil || live != nil {
+		t.Errorf("session survived the purge: %v %v", live, err)
+	}
+	if entries, err := st.Transcript(ctx, "conv-chat", 10); err != nil || len(entries) != 0 {
+		t.Errorf("transcript survived the purge: %d %v", len(entries), err)
+	}
+	if turn, err := st.Turn(ctx, "$turn-chat"); err != nil || turn != nil {
+		t.Errorf("turn survived the purge: %v %v", turn, err)
+	}
+	if notices, err := st.Notices(ctx, "chat", "", 10); err != nil || len(notices) != 0 {
+		t.Errorf("notice survived the purge: %d %v", len(notices), err)
+	}
+	if cmd, err := st.Command(ctx, "$cmd-chat"); err != nil || cmd != nil {
+		t.Errorf("command survived the purge: %v %v", cmd, err)
+	}
+	if note, err := st.NotificationByEvent(ctx, "$note-chat"); err != nil || note != nil {
+		t.Errorf("notification survived the purge: %v %v", note, err)
+	}
+	if poll, err := st.Poll(ctx, "$poll-chat"); err != nil || poll != nil {
+		t.Errorf("poll survived the purge: %v %v", poll, err)
+	}
+
+	// Kept: the other room, and the shared media cache.
+	if sess, err := st.SessionByID(ctx, kept); err != nil || sess == nil {
+		t.Errorf("another room's session was purged: %v %v", sess, err)
+	}
+	if entries, err := st.Transcript(ctx, "conv-other", 10); err != nil || len(entries) != 1 {
+		t.Errorf("another room's transcript was purged: %d %v", len(entries), err)
+	}
+	if turn, err := st.Turn(ctx, "$turn-other"); err != nil || turn == nil {
+		t.Errorf("another room's turn was purged: %v %v", turn, err)
+	}
+	if notices, err := st.Notices(ctx, "other", "", 10); err != nil || len(notices) != 1 {
+		t.Errorf("another room's notice was purged: %d %v", len(notices), err)
+	}
+	if note, err := st.NotificationByEvent(ctx, "$note-other"); err != nil || note == nil {
+		t.Errorf("another room's notification was purged: %v %v", note, err)
+	}
+	if media, err := st.Media(ctx, "hash"); err != nil || media == nil {
+		t.Errorf("the shared media cache was purged: %v %v", media, err)
+	}
+}
+
+// The per-conversation KV keys carry a NUL separator, which is exactly where
+// SQLite's string functions stop reading — so the prefix delete has to be a
+// range, and has to stop at the room it was given.
+func TestDeleteKVPrefix(t *testing.T) {
+	ctx := context.Background()
+	st := open(t)
+
+	rows := map[string]string{
+		"toolset:chat\x00:rw":     "12:on:1",
+		"toolset:chat\x00$thr:rw": "13:on:1",
+		"toolset:chatter\x00:rw":  "14:on:1",
+		"toolset:other\x00:rw":    "15:on:1",
+		"model_override:chat":     "qwen38",
+		"compact:chat\x00":        "1",
+	}
+	for key, value := range rows {
+		if err := st.SetKV(ctx, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.DeleteKVPrefix(ctx, "toolset:chat\x00"); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"toolset:chat\x00:rw":     "",
+		"toolset:chat\x00$thr:rw": "",
+		// A room whose name merely starts the same is a different room.
+		"toolset:chatter\x00:rw": "14:on:1",
+		"toolset:other\x00:rw":   "15:on:1",
+		// Room settings are not conversation state.
+		"model_override:chat": "qwen38",
+		"compact:chat\x00":    "1",
+	} {
+		got, err := st.GetKV(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("%q = %q, want %q", key, got, want)
+		}
+	}
+}

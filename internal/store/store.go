@@ -291,6 +291,14 @@ func (s *Store) PutRoom(ctx context.Context, key, roomID, stateHash string) erro
 	return err
 }
 
+// ForgetRoomID drops the mapping from a config key to the room it created, so
+// the next reconciliation builds a new one. The old room is not touched: it
+// keeps its history and simply stops being the portal.
+func (s *Store) ForgetRoomID(ctx context.Context, key string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM rooms WHERE key = ?`, key)
+	return err
+}
+
 // Rooms returns the whole key -> room ID map, for the reverse lookup the
 // event handler does on every incoming event.
 func (s *Store) Rooms(ctx context.Context) (map[string]string, error) {
@@ -1167,6 +1175,62 @@ func (s *Store) MarkTxn(ctx context.Context, txnID string) (bool, error) {
 }
 
 // --- housekeeping ----------------------------------------------------------
+
+// PurgeRoom forgets every conversation of one room: its sessions, the
+// transcripts and turns that hang off them, the bridge's own messages and the
+// commands that caused them, the notifications posted there and the polls it
+// was waiting on.
+//
+// It is the half of /purge that happens after the room itself is empty —
+// leaving the rows behind would have /history listing conversations whose
+// messages no longer exist. Dropping the sessions is also what starts the new
+// conversation: the next message finds none and opens one, exactly as it does
+// after /new.
+//
+// Two things are kept on purpose. Media is a content-addressed cache shared
+// with every other room, and the outbox holds calls owed to other systems
+// rather than anything that was said here.
+func (s *Store) PurgeRoom(ctx context.Context, roomKey string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Transcripts and turns first: both are found through the sessions, which
+	// have to still be there to find them.
+	for _, query := range []string{
+		`DELETE FROM transcripts WHERE conv_id IN (SELECT conv_id FROM sessions WHERE room_key = ?)`,
+		`DELETE FROM turns WHERE session_id IN (SELECT id FROM sessions WHERE room_key = ?)`,
+		`DELETE FROM sessions WHERE room_key = ?`,
+		`DELETE FROM notices WHERE room_key = ?`,
+		`DELETE FROM commands WHERE room_key = ?`,
+		`DELETE FROM notifications WHERE room_key = ?`,
+		`DELETE FROM polls WHERE room_key = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, query, roomKey); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// DeleteKVPrefix drops every KV row whose key starts with prefix, for the
+// per-conversation state that is keyed by room rather than stored in a table.
+//
+// It is a range rather than LIKE or substr because those keys carry a NUL
+// separator, and SQLite's string functions stop reading a value at the first
+// one — length('toolset:chat\x00') is 12, so a prefix match built from it
+// would never match anything. Comparison reads the whole stored value, so the
+// range does. The caller's prefix must not end in 0xff, which a NUL-terminated
+// one never does.
+func (s *Store) DeleteKVPrefix(ctx context.Context, prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+	end := prefix[:len(prefix)-1] + string([]byte{prefix[len(prefix)-1] + 1})
+	_, err := s.db.ExecContext(ctx, `DELETE FROM kv WHERE key >= ? AND key < ?`, prefix, end)
+	return err
+}
 
 // Cleanup drops history that is past its retention. Notifications are kept
 // longer than deliveries because a reaction can arrive days after the message.
