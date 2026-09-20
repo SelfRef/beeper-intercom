@@ -292,12 +292,11 @@ func (s *Service) commandNew(ctx context.Context, msg *bridge.Message, room conf
 		if err := s.store.CloseSession(ctx, live.ID); err != nil {
 			return "Could not close the conversation: " + err.Error()
 		}
+		// No link to what was just closed: /new is a deliberate line under the
+		// conversation, and the one place it is worth pointing back is the
+		// rotation nobody asked for. `/link` is still there for anyone who
+		// wants the old one.
 		out.WriteString("New conversation.")
-		if backend, ok := s.agentFor(live.Agent); ok {
-			if link := backend.Link(live.ConvID); link != "" {
-				fmt.Fprintf(&out, " Previous: %s", link)
-			}
-		}
 	}
 
 	// The new session does not exist yet — it is created by the first message
