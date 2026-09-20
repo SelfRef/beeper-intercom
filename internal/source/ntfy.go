@@ -23,9 +23,9 @@ import (
 // ntfy has no outbound webhooks, but a topic is a JSON stream, so the bridge
 // subscribes as one more client. The point is that nothing on the publishing
 // side changes: existing scripts keep posting to ntfy, ntfy keeps working for
-// the out-of-band case (the alarm that has to arrive when this stack is
-// down), and the same message also shows up in Beeper with history, threads
-// and reactions.
+// the out-of-band case (the alarm that has to arrive when the rest of the
+// deployment is down), and the same message also shows up in Beeper with
+// history, threads and reactions.
 type Ntfy struct {
 	cfg   config.Source
 	store *store.Store

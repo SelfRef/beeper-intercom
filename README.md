@@ -216,7 +216,7 @@ switches itself off after that long without a turn and says so in the room.
 ```yaml
 toolsets:
   rw:
-    description: Write access to my files, photos and repos
+    description: Write access to the user's files, photos and repos
     tools: [server:mcp:mcphub-me-rw]
     default: false
     idle: 15m

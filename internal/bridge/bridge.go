@@ -366,8 +366,8 @@ const loginStateTTL = time.Hour
 const (
 	// pingInterval is how often we send a `ping` command over the appservice
 	// websocket. hungryserv closes a socket that has been silent for around
-	// five minutes, so a bridge that never pings reconnects all day; every
-	// bbctl-generated config in this stack sets ping_interval_seconds: 180,
+	// five minutes, so a bridge that never pings reconnects all day;
+	// bbctl-generated bridge configs default to ping_interval_seconds: 180,
 	// and that is where this number comes from.
 	pingInterval = 180 * time.Second
 	// pingTimeout bounds one ping. A server that has not answered in this
