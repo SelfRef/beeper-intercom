@@ -60,6 +60,26 @@ type ghostInfo struct {
 	MXID string `json:"mxid"`
 }
 
+// The MCP spec requires a tool's outputSchema to be an object schema, and the
+// Go SDK derives it from the result type, so a bare slice produces
+// "type": ["null", "array"] and a strict client (MCPHub) rejects the WHOLE
+// tools/list response. Every list tool therefore returns a one-field wrapper.
+type roomList struct {
+	Rooms []roomInfo `json:"rooms"`
+}
+
+type ghostList struct {
+	Ghosts []ghostInfo `json:"ghosts"`
+}
+
+type sessionList struct {
+	Sessions []*store.Session `json:"sessions"`
+}
+
+type notificationList struct {
+	Notifications []*store.Notification `json:"notifications"`
+}
+
 type listSessionsInput struct {
 	IncludeClosed bool `json:"include_closed,omitempty" jsonschema:"include conversations that have already been closed"`
 	Limit         int  `json:"limit,omitempty" jsonschema:"maximum number of sessions to return"`
@@ -140,7 +160,7 @@ func register(server *mcp.Server, svc *service.Service) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_rooms",
 		Description: "List the rooms this bridge owns, with their kind, ghosts and agent.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, []roomInfo, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, roomList, error) {
 		cfg := svc.Config()
 		ids := svc.Bridge().RoomIDs()
 		out := make([]roomInfo, 0, len(cfg.Rooms))
@@ -151,27 +171,27 @@ func register(server *mcp.Server, svc *service.Service) {
 				Ghosts: room.Ghosts, Agent: room.Agent, RoomID: ids[key].String(),
 			})
 		}
-		return nil, out, nil
+		return nil, roomList{Rooms: out}, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_ghosts",
 		Description: "List the identities that can speak in this bridge's rooms.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, []ghostInfo, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, ghostList, error) {
 		cfg := svc.Config()
 		out := make([]ghostInfo, 0, len(cfg.Ghosts))
 		for _, key := range config.SortedKeys(cfg.Ghosts) {
 			out = append(out, ghostInfo{Key: key, Name: cfg.Ghosts[key].Name, MXID: svc.Bridge().GhostMXID(key).String()})
 		}
-		return nil, out, nil
+		return nil, ghostList{Ghosts: out}, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_sessions",
 		Description: "List conversations, newest activity first.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listSessionsInput) (*mcp.CallToolResult, []*store.Session, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listSessionsInput) (*mcp.CallToolResult, sessionList, error) {
 		sessions, err := svc.Store().ListSessions(ctx, in.IncludeClosed, in.Limit)
-		return nil, sessions, err
+		return nil, sessionList{Sessions: sessions}, err
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -185,9 +205,9 @@ func register(server *mcp.Server, svc *service.Service) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_recent_notifications",
 		Description: "Recent announcements, with their source payloads and declared actions.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listNotificationsInput) (*mcp.CallToolResult, []*store.Notification, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listNotificationsInput) (*mcp.CallToolResult, notificationList, error) {
 		notifications, err := svc.Store().RecentNotifications(ctx, in.Room, in.Limit)
-		return nil, notifications, err
+		return nil, notificationList{Notifications: notifications}, err
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
