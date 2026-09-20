@@ -357,12 +357,17 @@ func (r Reactions) Emoji(phase string) string {
 // Reasoning describes how this installation names the thinking variants of a
 // model, so that /think can move between them.
 //
-// It is a NAMING convention, not a protocol: llama-swap (and most catalogues
-// like it) publish one model id per reasoning effort — `qwen38`, `qwen38:t`,
-// `qwen38:m` — and the only thing the bridge has to know is which suffix means
-// what. The bare id, with no suffix at all, is always "off": a model that does
-// not think. Nothing here is specific to a suffix style; a deployment that
+// It is a NAMING convention, not a protocol: catalogues of this kind publish
+// one model id per reasoning effort — `some-model`, `some-model:t`,
+// `some-model:m` — and the only thing the bridge has to know is which suffix
+// means what. Nothing here is specific to a suffix style; a deployment that
 // writes `-high` instead of `:x` just says so.
+//
+// Which id means "does not think" is also the deployment's to say. Usually it
+// is the bare id, and OffSuffix is empty. But a catalogue is free to make the
+// bare id the thinking one and give the non-thinking variant a suffix of its
+// own, in which case OffSuffix names it — otherwise /think off would be a
+// button that quietly does nothing.
 //
 // Which levels a given model actually has is never assumed: the backend's own
 // model list decides, so /think offers the variants that exist and says so
@@ -375,6 +380,15 @@ type Reasoning struct {
 	// Levels are the suffixes, lowest effort first — the order /think lists
 	// them in. "off" is implicit and always first.
 	Levels []ReasoningLevel `yaml:"levels"`
+	// OffSuffix reaches the non-thinking variant when the bare id is not it.
+	// Empty (the default) means the bare id is the off one.
+	OffSuffix string `yaml:"off_suffix"`
+}
+
+// Off is the non-thinking variant as a level, so that the rest of the code can
+// treat it like any other one. Its id is the reserved word /think takes.
+func (r Reasoning) Off() ReasoningLevel {
+	return ReasoningLevel{Name: "Off", IDs: []string{ReasoningOff}, Suffix: r.OffSuffix}
 }
 
 // ReasoningLevel is one suffix, what it is called, and what you may type for
@@ -409,12 +423,18 @@ func (l ReasoningLevel) Label() string {
 	return l.Name
 }
 
-// Split takes a model id apart into its bare id and its reasoning level, or
-// nil when the id carries no known suffix (which is the "off" variant).
+// Split takes a model id apart into its bare id and its reasoning level. The
+// level is nil when the id carries no known suffix: with no OffSuffix that is
+// the "off" variant, and with one it is the id whose effort the catalogue
+// picks by itself.
 func (r Reasoning) Split(model string) (string, *ReasoningLevel) {
+	candidates := r.Levels
+	if r.OffSuffix != "" {
+		candidates = append(append([]ReasoningLevel{}, r.Levels...), r.Off())
+	}
 	var best *ReasoningLevel
-	for i := range r.Levels {
-		level := &r.Levels[i]
+	for i := range candidates {
+		level := &candidates[i]
 		// Longest suffix wins: ":xl" must not be read as ":x" plus a stray l.
 		if level.Suffix != "" && strings.HasSuffix(model, level.Suffix) &&
 			(best == nil || len(level.Suffix) > len(best.Suffix)) {
@@ -797,6 +817,9 @@ func (c *Config) Validate() error {
 	}
 	seenID := map[string]bool{}
 	seenSuffix := map[string]bool{}
+	if c.Reasoning.OffSuffix != "" {
+		seenSuffix[c.Reasoning.OffSuffix] = true
+	}
 	for i, level := range c.Reasoning.Levels {
 		switch {
 		case level.Name == "":
@@ -805,6 +828,8 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("reasoning.levels[%d] (%s): no suffix; the bare id already means no reasoning", i, level.Name)
 		case len(level.IDs) == 0:
 			return fmt.Errorf("reasoning.levels[%d] (%s): no ids; there would be no way to select it", i, level.Name)
+		case level.Suffix == c.Reasoning.OffSuffix:
+			return fmt.Errorf("reasoning.levels[%d] (%s): suffix %q is already reasoning.off_suffix", i, level.Name, level.Suffix)
 		case seenSuffix[level.Suffix]:
 			return fmt.Errorf("reasoning.levels: suffix %q is declared twice", level.Suffix)
 		}
@@ -814,7 +839,7 @@ func (c *Config) Validate() error {
 			case !keyRe.MatchString(id):
 				return fmt.Errorf("reasoning.levels[%d] (%s): id %q must match %s (it is typed into /think)", i, level.Name, id, keyRe)
 			case strings.EqualFold(id, ReasoningOff):
-				return fmt.Errorf("reasoning.levels[%d] (%s): %q is reserved — the bare model id is always the off variant", i, level.Name, ReasoningOff)
+				return fmt.Errorf("reasoning.levels[%d] (%s): %q is reserved — it always selects the non-thinking variant (reasoning.off_suffix, or the bare id when that is empty)", i, level.Name, ReasoningOff)
 			case seenID[strings.ToLower(id)]:
 				return fmt.Errorf("reasoning.levels: id %q is declared twice", id)
 			}
@@ -976,6 +1001,6 @@ func SortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-// ReasoningOff is the word /think takes for the bare, non-thinking model id.
+// ReasoningOff is the word /think takes for the non-thinking model id.
 // It is not a level: there is no suffix to configure for "no suffix".
 const ReasoningOff = "off"

@@ -299,6 +299,11 @@ reasoning:
   # Off by default: without the convention, /think would be a command that
   # cannot work.
   enabled: false
+  # `off` is not a level: it is whichever id does not think. Usually that is
+  # the bare id and this stays empty. Set it when the catalogue makes the bare
+  # id a thinking one and gives the non-thinking variant a suffix of its own,
+  # or `/think off` would be a button that quietly changes nothing.
+  # off_suffix: ":nt"
   # Lowest effort first — this is the order /think lists them in. `name` is the
   # display name; `ids` are the words /think accepts for it, most explicit
   # first, so a level can be reached by its name or by its suffix letter.

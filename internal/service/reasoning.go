@@ -16,9 +16,10 @@ import (
 //
 // Reasoning effort is not a parameter in most self-hosted catalogues: it is a
 // separate model id, one per level, by convention a suffix on a shared base
-// (`qwen38`, `qwen38:t`, `qwen38:m`). So /think is /model with the base held
-// fixed — and because the convention is the deployment's, not the bridge's,
-// the suffixes come from config.
+// (`some-model`, `some-model:t`, `some-model:m`). So /think is /model with the
+// base held fixed — and because the convention is the deployment's, not the
+// bridge's, the suffixes come from config, including the one that means "do
+// not think" when that is not the bare id (reasoning.off_suffix).
 //
 // The change belongs to the conversation, not the room: a question that needs
 // more thought is a question, not a new setting. It is written to the session's
@@ -64,11 +65,12 @@ func (s *Service) commandThink(ctx context.Context, msg *bridge.Message, room co
 	var target, label string
 	switch {
 	case name == config.ReasoningOff:
-		label = "Off"
+		off := reasoning.Off()
+		label = off.Label()
 		if known && !variants[config.ReasoningOff] {
-			return fmt.Sprintf("`%s` cannot stop thinking — there is no variant of it without a reasoning suffix.", base)
+			return fmt.Sprintf("`%s` cannot stop thinking — there is no %s variant of it.", base, code(base+off.Suffix))
 		}
-		target = base
+		target = base + off.Suffix
 	default:
 		wanted, found := reasoning.Level(name)
 		if !found {
@@ -105,6 +107,10 @@ func reasoningList(base string, level *config.ReasoningLevel, reasoning config.R
 	currentID := config.ReasoningOff
 	if level != nil {
 		currentID = level.ID()
+	} else if reasoning.OffSuffix != "" {
+		// A bare id whose effort the catalogue chooses: it is not the off
+		// variant, so nothing in the table is the current one.
+		currentID = ""
 	}
 
 	rows := make([][]string, 0, len(reasoning.Levels)+1)
@@ -120,7 +126,8 @@ func reasoningList(base string, level *config.ReasoningLevel, reasoning config.R
 		rows = append(rows, row)
 	}
 	if !known || variants[config.ReasoningOff] {
-		add(config.ReasoningOff, "Off", "", "", []string{config.ReasoningOff})
+		off := reasoning.Off()
+		add(config.ReasoningOff, off.Label(), off.Suffix, "", off.IDs)
 	}
 	for _, lvl := range reasoning.Levels {
 		if known && !variants[lvl.ID()] {
@@ -158,7 +165,7 @@ func (s *Service) reasoningVariants(ctx context.Context, agentName, base string,
 	for _, m := range models {
 		served[m] = true
 	}
-	variants := map[string]bool{config.ReasoningOff: served[base]}
+	variants := map[string]bool{config.ReasoningOff: served[base+reasoning.OffSuffix]}
 	for _, level := range reasoning.Levels {
 		variants[level.ID()] = served[base+level.Suffix]
 	}
@@ -211,7 +218,7 @@ func (s *Service) applyPendingReasoning(ctx context.Context, roomKey, threadRoot
 	_ = s.store.SetKV(ctx, key, "")
 	base, _ := reasoning.Split(model)
 	if name == config.ReasoningOff {
-		return base
+		return base + reasoning.OffSuffix
 	}
 	level, found := reasoning.Level(name)
 	if !found {
@@ -227,7 +234,15 @@ func reasoningNote(reasoning config.Reasoning, model string) string {
 		return ""
 	}
 	if _, level := reasoning.Split(model); level != nil {
+		if level.Suffix == reasoning.OffSuffix {
+			return no(strings.ToLower(level.Label()))
+		}
 		return level.Label()
+	}
+	if reasoning.OffSuffix != "" {
+		// The catalogue picks the effort for a bare id, and the bridge has no
+		// way to ask which one it picked.
+		return "default"
 	}
 	return no("off")
 }

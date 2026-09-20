@@ -285,6 +285,7 @@ func TestReasoningValidation(t *testing.T) {
 		"no ids":           levels("    - { name: High, suffix: \":x\" }\n"),
 		"no name":          levels("    - { ids: [high], suffix: \":x\" }\n"),
 		"off is reserved":  levels("    - { name: Off, ids: [off], suffix: \":o\" }\n"),
+		"suffix is off_suffix": minimal + "\nreasoning:\n  enabled: true\n  off_suffix: \":nt\"\n  levels:\n    - { name: No think, ids: [nope], suffix: \":nt\" }\n",
 		"duplicate id":     levels("    - { name: High, ids: [h], suffix: \":x\" }\n    - { name: Huge, ids: [h], suffix: \":h\" }\n"),
 		"duplicate suffix": levels("    - { name: High, ids: [high], suffix: \":x\" }\n    - { name: Extra, ids: [extra], suffix: \":x\" }\n"),
 		"bad id":           levels("    - { name: High, ids: [\"Very High\"], suffix: \":x\" }\n"),
@@ -299,5 +300,27 @@ func TestReasoningValidation(t *testing.T) {
 	}
 	if base, level := cfg.Reasoning.Split("main:x"); base != "main" || level.Label() != "Extra High" {
 		t.Errorf("loaded levels do not parse a model id: %q %v", base, level)
+	}
+}
+
+// A catalogue whose bare id already thinks names its non-thinking variant with
+// a suffix like any other level, and /think off has to reach THAT one.
+func TestReasoningOffSuffix(t *testing.T) {
+	r := Reasoning{Enabled: true, OffSuffix: ":nt", Levels: []ReasoningLevel{
+		{Name: "Medium", IDs: []string{"medium", "m"}, Suffix: ":m"},
+	}}
+	if off := r.Off(); off.Suffix != ":nt" || off.ID() != ReasoningOff {
+		t.Errorf("Off() = %q/%q, want %q/%q", off.Suffix, off.ID(), ":nt", ReasoningOff)
+	}
+	if base, level := r.Split("some-model:nt"); base != "some-model" || level == nil || level.ID() != ReasoningOff {
+		t.Errorf("the off variant does not split back to its base: %q %v", base, level)
+	}
+	if base, level := r.Split("some-model"); base != "some-model" || level != nil {
+		t.Errorf("a bare id is no longer the off variant: %q %v", base, level)
+	}
+	// Without one, the bare id keeps meaning "off" — the default behaviour.
+	plain := Reasoning{Enabled: true, Levels: r.Levels}
+	if off := plain.Off(); off.Suffix != "" {
+		t.Errorf("Off() invented a suffix: %q", off.Suffix)
 	}
 }
