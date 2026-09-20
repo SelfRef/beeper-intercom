@@ -196,10 +196,11 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 	// why edits are the default of the two). If the bubble cannot be opened,
 	// the chunks are dropped and the answer arrives the old way — progress is
 	// comfort, not correctness.
-	answerOpts := bridge.SendOptions{ThreadRoot: msg.ThreadRoot}
-	if answerOpts.ThreadRoot != "" {
-		answerOpts.ReplyTo = msg.EventID
-	}
+	// The answer is sent as a reply to the question, which is how the web UI
+	// pairs them: in a room where several questions can be in flight at once,
+	// the quote is what says which answer belongs to which. Inside a thread
+	// the same field doubles as the thread's reply fallback.
+	answerOpts := bridge.SendOptions{ThreadRoot: msg.ThreadRoot, ReplyTo: msg.EventID}
 	progress := s.conf().Progress
 	streamOpts := bridge.StreamOptions{
 		Edits:    progress.Mode == config.ProgressEdits,
@@ -647,12 +648,25 @@ func isTimeout(err error) bool {
 		strings.Contains(text, "connection refused")
 }
 
-// onRedaction reacts to me deleting one of my own messages: a turn in flight
-// is cancelled — the one way to stop a model that is answering the wrong
-// question — and a command takes the bridge's answer to it with it.
+// onRedaction is me deleting one of my own messages, which the web UI treats
+// as deleting the exchange: the question and what it produced go together.
+// Three kinds of message can be deleted, and each takes its answer with it —
+// a command takes the bridge's reply, a question in flight is cancelled, and a
+// question that has been answered takes the answer out of the room and out of
+// the backend's conversation.
 func (s *Service) onRedaction(ctx context.Context, roomKey string, roomID id.RoomID, target id.EventID) {
 	s.clearDeletedCommand(ctx, roomKey, roomID, target)
+	if s.cancelDeletedTurn(ctx, roomKey, target) {
+		return
+	}
+	s.undoDeletedTurn(ctx, roomKey, roomID, target)
+}
 
+// cancelDeletedTurn stops a model that is answering a question I have taken
+// back — the one way to stop one at all. Reports whether there was one: a turn
+// that is still running has no answer in the room yet, so there is nothing to
+// undo after it.
+func (s *Service) cancelDeletedTurn(ctx context.Context, roomKey string, target id.EventID) bool {
 	s.turnMu.Lock()
 	var found *runningTurn
 	for key, turn := range s.turns {
@@ -664,7 +678,7 @@ func (s *Service) onRedaction(ctx context.Context, roomKey string, roomID id.Roo
 	}
 	s.turnMu.Unlock()
 	if found == nil {
-		return
+		return false
 	}
 	found.cancel()
 
@@ -678,6 +692,61 @@ func (s *Service) onRedaction(ctx context.Context, roomKey string, roomID id.Roo
 		}
 	}
 	s.log.Info().Str("room", roomKey).Msg("Cancelled a turn after its message was deleted")
+	return true
+}
+
+// undoDeletedTurn is /undo without the command: deleting a question deletes
+// what it was answered with, in the room and in the backend, exactly as
+// deleting a message in the web UI does. Anything that fails here is logged
+// rather than reported — there is no message left to report it under, and the
+// room has already lost the question.
+func (s *Service) undoDeletedTurn(ctx context.Context, roomKey string, roomID id.RoomID, target id.EventID) {
+	turn, err := s.store.Turn(ctx, target.String())
+	if err != nil || turn == nil {
+		return
+	}
+	room := s.conf().Rooms[roomKey]
+	ghostKey := ""
+	if len(room.Ghosts) > 0 {
+		ghostKey = room.Ghosts[0]
+	}
+	// Every event the answer occupies: the anchor, the interim edits that grew
+	// it, the later parts of a split answer, the attached file. An edit is its
+	// own event and outlives a redaction of the anchor.
+	for _, raw := range turn.AnswerEvents {
+		if err := s.bridge.Redact(ctx, roomID, ghostKey, id.EventID(raw)); err != nil {
+			s.log.Debug().Err(err).Str("event", raw).Msg("Could not redact an answer event")
+		}
+	}
+
+	sess, err := s.store.SessionByID(ctx, turn.SessionID)
+	if err != nil || sess == nil {
+		return
+	}
+	if backend, ok := s.agentFor(sess.Agent); ok {
+		undoCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		err := backend.Undo(undoCtx, sess.ConvID, turn.UserMsgID)
+		cancel()
+		switch {
+		case errors.Is(err, agent.ErrUnsupported):
+			s.log.Debug().Msg("Backend cannot delete an exchange")
+		case err != nil:
+			s.log.Warn().Err(err).Msg("Could not delete the exchange from the backend")
+		}
+	}
+	// Only the newest turn moves the conversation's parent. Deleting an older
+	// one takes it out of the record, but what the next turn continues from is
+	// still the tip — and LastTurn only looks at live conversations, so a turn
+	// from one that has already been closed never rewinds anything.
+	if last, err := s.store.LastTurn(ctx, sess.RoomKey, sess.ThreadRoot); err == nil &&
+		last != nil && last.EventID == turn.EventID {
+		if err := s.store.RewindSession(ctx, sess.ID, turn.ParentID); err != nil {
+			s.log.Warn().Err(err).Msg("Could not rewind the conversation after a deleted question")
+		}
+	}
+	if err := s.store.DeleteTurn(ctx, turn.EventID); err != nil {
+		s.log.Warn().Err(err).Msg("Could not forget a deleted turn")
+	}
 }
 
 // eventStrings is the storable form of an event list.

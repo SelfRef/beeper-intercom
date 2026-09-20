@@ -308,6 +308,20 @@ notices:
   format_commands: true  # rewrite your `/command` as inline code
 ```
 
+**Deleting one of your own messages** does what deleting a message in the web
+UI does: it takes the answer with it. For a question already answered that
+means every event the answer occupies leaves the room and the exchange is
+deleted from the backend's conversation, so the next turn is not answering
+something you have taken back — `/undo`, without the command. Deleting the
+newest question also rewinds the conversation to before it; deleting an older
+one only takes it out of the record, because the tip has not moved. A question
+still being answered is cancelled instead, which is the one way to stop a model
+that is answering the wrong thing.
+
+Each answer is sent as a **reply** to the question that caused it, as the web
+UI pairs the two. In a thread the same relation is the thread's reply fallback,
+so nothing changes there.
+
 **Editing a command** you already sent: if it is the newest one and the
 conversation is still the same, the edit is a correction — whatever it produced
 is swept out of the room and the new text runs in its place. Anything older is
