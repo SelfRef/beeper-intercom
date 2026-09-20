@@ -20,6 +20,12 @@ func (b *Bridge) handleMessage(ctx context.Context, evt *event.Event) {
 	if !ok || content == nil {
 		return
 	}
+	// An edit the BRIDGE made to one of my own messages (see EditMine): it
+	// carries no new instruction, and handling it would re-run the command it
+	// is only there to reformat.
+	if raw, ok := evt.Content.Raw[CommandFormatKey].(bool); ok && raw {
+		return
+	}
 	if b.handlers.OnMessage == nil {
 		return
 	}

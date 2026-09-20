@@ -48,9 +48,27 @@ type Service struct {
 	// Version is reported in the status room on startup; main sets it.
 	Version string
 
-	turnMu  sync.Mutex
-	turns   map[string]*runningTurn // session key -> in-flight turn
-	waiters sync.Map                // poll event ID -> chan string
+	turnMu sync.Mutex
+	turns  map[string]*runningTurn // session key -> in-flight turn
+
+	// toolsetTimers are the idle countdowns of switched-on toolsets, so an
+	// escalation closes itself and says so rather than waiting to be noticed.
+	toolsetMu     sync.Mutex
+	toolsetTimers map[string]*time.Timer
+
+	// pendingAsks are the questions waiting for an answer, by conversation
+	// slot. A Matrix poll cannot take a typed answer, so a message sent while
+	// one is open is delivered here instead of starting a new turn.
+	askMu       sync.Mutex
+	pendingAsks map[string]*openQuestion
+
+	// noticeAvatar caches the uploaded mxc for the notice profile's avatar, so
+	// a notice does not read and hash a file every time.
+	noticeMu         sync.Mutex
+	noticeAvatar     string
+	noticeAvatarPath string
+
+	waiters sync.Map // poll event ID -> chan string
 
 	startedAt time.Time
 }
@@ -75,14 +93,16 @@ type runningTurn struct {
 // handlers are service methods.
 func New(cfg *config.Config, configPath string, st *store.Store, log zerolog.Logger) (*Service, error) {
 	s := &Service{
-		configPath: configPath,
-		store:      st,
-		log:        log,
-		agents:     map[string]agent.Agent{},
-		queue:      make(chan *sendJob, cfg.Limits.QueueSize),
-		turns:      map[string]*runningTurn{},
-		ready:      make(chan struct{}),
-		startedAt:  time.Now(),
+		configPath:    configPath,
+		store:         st,
+		log:           log,
+		agents:        map[string]agent.Agent{},
+		queue:         make(chan *sendJob, cfg.Limits.QueueSize),
+		turns:         map[string]*runningTurn{},
+		toolsetTimers: map[string]*time.Timer{},
+		pendingAsks:   map[string]*openQuestion{},
+		ready:         make(chan struct{}),
+		startedAt:     time.Now(),
 	}
 	s.cfg.Store(cfg)
 	if err := s.buildAgents(cfg); err != nil {
@@ -488,6 +508,14 @@ func (s *Service) onReaction(ctx context.Context, evt *bridge.Reaction) {
 	if !ok {
 		return
 	}
+	// Reacting to one of my own command messages is how I throw it away
+	// together with whatever the bridge answered — a bridge message cannot be
+	// reacted to, so the command is the only handle there is. It is never an
+	// action: my own messages declare none.
+	if evt.Sender == s.bridge.UserID() && s.cleanForCommand(ctx, evt, room) {
+		return
+	}
+
 	webhook := s.actionWebhook(room)
 	if webhook == "" {
 		return

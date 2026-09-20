@@ -71,6 +71,13 @@ rooms:
     topic: Things that want attention now.
     kind: broadcast
     ghosts: [alerts]
+    # Keep the "This message has been deleted" tombstone in this room. The
+    # bridge hides it everywhere by default (com.beeper.room_features
+    # delete_hide_placeholder) because it deletes its own messages as ordinary
+    # work — /undo, commands tidying up after themselves — and a tombstone is
+    # louder than what it replaced. In a room somebody acts on, a silent
+    # disappearance can be worse than a marker.
+    delete_placeholder: true
     # priority high/urgent mentions you by name in this room only — and a
     # mention notifies even when the room is muted, which is the point: mute
     # Alerts, let the urgent ones through. (Beeper never fires @room, so the
@@ -92,6 +99,9 @@ agents:
   main:
     type: openwebui
     url: http://openwebui:8080
+    # Where a human reaches the same backend. Links (/link, /history, /share)
+    # use it; without it they point at the compose hostname above.
+    # public_url: https://chat.example.com
     api_key_env: OWUI_API_KEY
     # Optional session JWT (not the API key) for the socket.io room, which is
     # where Open WebUI emits a running turn's tokens. Without it answers still
@@ -100,10 +110,26 @@ agents:
     model: my-model
     # Created if missing; keeps bridge chats out of the main sidebar.
     folder: Intercom
-    # Answers stream into the bubble token by token (com.beeper.stream) and
-    # are committed as an edit when complete. Set to true for one message per
-    # answer instead.
+    # One message per answer instead of a growing one. See `progress:` below
+    # for how a growing one is rendered.
     no_stream: false
+    # Tools this agent always has. Open WebUI does NOT apply a model's own
+    # configured toolIds to API callers, so whatever is not listed here (or in
+    # a toolset below) is not offered to the model.
+    # tool_ids: [server:mcp:example]
+    # Open WebUI's built-in capabilities. These make the adapter send a session
+    # id, which is what unlocks them — see the README.
+    # features: [web_search]
+    # Switchable groups, on top of tool_ids. State belongs to the conversation:
+    # it starts at `default`, `/tools` changes it, the next conversation starts
+    # from `default` again.
+    # toolsets:
+    #   rw:
+    #     description: Write access to my files and repositories
+    #     tools: [server:mcp:example-rw]
+    #     default: false
+    #     # Switches itself off after this long without a turn, and says so.
+    #     idle: 15m
     session:
       # A new topic after a long gap should not inherit stale context.
       idle_minutes: 120
@@ -162,6 +188,121 @@ actions:
   # Report reactions no notification declared, with a null action name, so new
   # conventions can be invented on the receiving side without a redeploy.
   report_undeclared: true
+
+# How a running answer is shown. `off` is the default: nothing is posted until
+# the answer is finished, and the ghost simply types the whole time — no
+# placeholder bubble to explain.
+progress:
+  # off    nothing until the answer is done
+  # edits  post the first chunk and rewrite it with the answer so far
+  # stream com.beeper.stream deltas to subscribed devices instead. Correct per
+  #        the protocol and nearly free, but measured on 2026-09-20 NO client
+  #        painted them: they are delivered, subscribed to, and dropped before
+  #        the UI. Kept for the day one does.
+  mode: off
+  # Edit cadence. Floor 250ms — an edit per token is a flood, not a stream.
+  interval: 1.5s
+  # Appended to every partial rendering, never to the finished answer.
+  suffix: " …"
+  # The reaction on the question while the answer is produced, one emoji per
+  # phase; "" leaves a phase unmarked, and a phase the backend never reports
+  # is never shown (an adapter that only knows "working" stays on queued).
+  # Which ones you actually see depends on the backend: Open WebUI reports all
+  # five, a plain OpenAI endpoint reports queued and writing.
+  reactions:
+    queued: "⏳"   # accepted, nothing back yet — the queue and the prompt being processed
+    thinking: "🧠" # reasoning tokens
+    tools: "🛠️"   # a tool call
+    web: "🌐"      # a tool call that goes out to the network
+    writing: "✍️"  # the answer itself
+    asking: "❓"    # the model asked YOU something and is waiting
+    compacting: "🗜️" # /compact summarising the conversation in place
+
+# How the bridge's own messages are told apart from the agent's.
+#
+# A conversational room has one ghost and two voices: the agent answering, and
+# the bridge reporting on itself ("Nothing to undo yet."). Beeper renders
+# m.notice exactly like a normal message inside a portal, so the difference has
+# to be made here.
+notices:
+  # bot   the bridge bot sends them. Its m.notice renders as dim centred text
+  #       with no bubble — in ANY room, not just a bridge-bot room (measured
+  #       2026-09-20). This is the only rendering that is unmistakably not the
+  #       agent, so it is the default. That rendering centres the whole
+  #       message, which is why bridge messages are laid out as tables and
+  #       never as bullet lists (a list's markers stay at the left margin).
+  # ghost the room's ghost sends them, which looks like an ordinary message;
+  #       then the per-message profile below is what distinguishes them.
+  sender: bot
+  # Only used with sender: ghost. A per-message profile
+  # (com.beeper.per_message_profile) lets one ghost speak under its own name
+  # and avatar for one message, which keeps a dm a dm — a second room member
+  # would not. "" turns it off.
+  name: System
+  # The profile's stable identity; clients derive the name colour and the
+  # generated avatar from it.
+  id: system
+  # Optional image, as a ghost's avatar. Without one the client generates one.
+  # avatar: avatars/system.png
+  # A notice caused by a command is sent as a reply to it. Notices nobody asked
+  # for (a toolset going idle) are never replies.
+  reply: true
+  # React to one of YOUR OWN command messages and it is removed together with
+  # everything the bridge said in answer to it. A bridge message cannot be
+  # reacted to, so the command is the only handle there is — and because the
+  # bridge hides the deletion tombstone, the pair simply disappears. `/clean`
+  # does the same without a reaction.
+  clean_on_reaction: true
+  # Which reactions do that. Empty means any of them; list a few to keep the
+  # rest free for other meanings.
+  clean_emoji: []
+  # Rewrite a command you typed as inline code, so `/help` reads as a command
+  # rather than as something you said. The bridge cannot edit someone else's
+  # event, but the message is yours and it holds your account token, so it
+  # sends the edit AS you — which means the client marks it "Edited".
+  format_commands: true
+
+# When the model asks YOU something. Open WebUI's ask_user tool does not run
+# and return: it stops the turn with the questions staged on the message,
+# expecting a UI to draw a card for them. A chat already has a way to ask a
+# question with fixed answers, so each one becomes a poll and the answers
+# resume the turn where it stopped.
+questions:
+  # How long a question waits. Generous on purpose: the turn is paused on the
+  # backend, costing nothing, and a question asked while you are away is still
+  # worth answering when you get back. Unanswered questions are reported as
+  # such, and the model carries on without them.
+  timeout: 10m
+  # Remove an answered question from the room. Off by default — the question
+  # and the answer are part of how the conversation went. Either way the poll
+  # is ENDED once answered, so the answer cannot be changed to one the model
+  # never saw.
+  delete_after_answer: false
+
+# How hard the model thinks, as a command instead of a model id.
+#
+# Most self-hosted catalogues publish one model id per reasoning effort, by
+# convention a suffix on a shared base: `main`, `main:t`, `main:m`. Declare the
+# convention here and `/think` moves between them, keeping the base fixed. The
+# BARE id — no suffix at all — is always the "off" variant, so there is nothing
+# to configure for it.
+#
+# Which levels a given model actually has is never assumed: the backend's model
+# list decides, so `/think` offers the variants that exist and says so when a
+# model has none. A change applies to the current conversation only.
+reasoning:
+  # Off by default: without the convention, /think would be a command that
+  # cannot work.
+  enabled: false
+  # Lowest effort first — this is the order /think lists them in. `name` is the
+  # display name; `ids` are the words /think accepts for it, most explicit
+  # first, so a level can be reached by its name or by its suffix letter.
+  levels:
+    - { name: Think, ids: [think, t], suffix: ":t", description: thinking on }
+    - { name: Low, ids: [low, l], suffix: ":l" }
+    - { name: Medium, ids: [medium, m], suffix: ":m" }
+    - { name: High, ids: [high, h], suffix: ":h" }
+    - { name: Extra High, ids: [extra, x], suffix: ":x", description: as much as it will do }
 
 log:
   level: info

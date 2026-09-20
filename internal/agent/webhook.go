@@ -77,16 +77,15 @@ type turnReply struct {
 }
 
 func (w *webhook) Send(ctx context.Context, conv Conversation, turn Turn, sink Sink) (*Reply, error) {
-	if sink.Status != nil {
-		sink.Status("thinking")
-	}
+	// A webhook is a black box: it is working, which is all "queued" claims.
+	sink.Report("queued")
 	body := map[string]any{
 		"conv_id":  conv.ID,
 		"text":     turn.Text,
 		"internal": turn.Internal,
 		"turns":    conv.Turns,
 		// Tells the sidecar it may stream; one that cannot just answers JSON.
-		"stream": sink.Delta != nil && !w.cfg.NoStream,
+		"stream": sink.Streams() && !w.cfg.NoStream,
 	}
 	if len(turn.Attachments) > 0 {
 		atts := make([]map[string]any, 0, len(turn.Attachments))
@@ -133,9 +132,7 @@ func (w *webhook) readStream(body io.Reader, sink Sink) (*Reply, error) {
 		}
 		if evt.Delta != "" {
 			answer.WriteString(evt.Delta)
-			if sink.Delta != nil {
-				sink.Delta(evt.Delta)
-			}
+			sink.Push(evt.Delta)
 		}
 		if evt.Text != "" || evt.Link != "" {
 			final = evt
@@ -157,6 +154,40 @@ func (w *webhook) readStream(body io.Reader, sink Sink) (*Reply, error) {
 
 // Transcribe asks the sidecar: POST /transcribe with the audio as base64,
 // expecting {"text": "..."}. A 404 means it does not do voice.
+// Ask: a sidecar owns its own state; the bridge cannot ask it to forget.
+func (w *webhook) Ask(ctx context.Context, model, question string) (string, error) {
+	return "", ErrUnsupported
+}
+
+// Share: nothing to publish.
+func (w *webhook) Answer(ctx context.Context, conv Conversation, ask *Ask, answers map[string]string, sink Sink) (*Reply, error) {
+	return nil, ErrUnsupported
+}
+
+func (w *webhook) Undo(ctx context.Context, convID, userMessageID string) error {
+	return ErrUnsupported
+}
+
+func (w *webhook) Share(ctx context.Context, convID string) (string, error) {
+	return "", ErrUnsupported
+}
+
+// Compact: the bridge keeps this adapter's history, so compaction is its own
+// job — closing the conversation and seeding the next one with a summary.
+func (w *webhook) Compact(ctx context.Context, convID string) (string, error) {
+	return "", ErrUnsupported
+}
+
+// ContextUsage: nothing here counts tokens.
+func (w *webhook) ContextUsage(ctx context.Context, convID string) (string, error) {
+	return "", ErrUnsupported
+}
+
+// Models: a webhook sidecar decides for itself what it runs.
+func (w *webhook) Models(ctx context.Context) ([]string, error) {
+	return nil, ErrUnsupported
+}
+
 func (w *webhook) Transcribe(ctx context.Context, att Attachment) (string, error) {
 	var resp struct {
 		Text string `json:"text"`

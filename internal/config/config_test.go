@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // write puts a config file in a temp dir and loads it.
@@ -170,5 +171,133 @@ server:
 	}
 	if cfg.AdminToken() != "from-env" {
 		t.Errorf("admin token = %q", cfg.AdminToken())
+	}
+}
+
+func TestProgressDefaults(t *testing.T) {
+	cfg := &Config{}
+	cfg.applyDefaults()
+	if cfg.Progress.Mode != ProgressOff {
+		t.Fatalf("progress mode defaults to %q, want %q", cfg.Progress.Mode, ProgressOff)
+	}
+	if cfg.Progress.Suffix == "" {
+		t.Fatal("progress suffix has no default")
+	}
+	if got := cfg.Progress.Reactions.Emoji("web"); got == "" {
+		t.Fatal("web phase has no default emoji")
+	}
+	if got := cfg.Progress.Reactions.Emoji("nonsense"); got != "" {
+		t.Fatalf("unknown phase returned %q, want empty", got)
+	}
+	// An operator who names one emoji keeps exactly that one: the defaults are
+	// all-or-nothing, so a half-configured block cannot silently regrow.
+	custom := &Config{Progress: Progress{Reactions: Reactions{Thinking: "🤖"}}}
+	custom.applyDefaults()
+	if custom.Progress.Reactions.Queued != "" || custom.Progress.Reactions.Thinking != "🤖" {
+		t.Fatalf("custom reactions were overwritten: %+v", custom.Progress.Reactions)
+	}
+}
+
+func TestProgressValidation(t *testing.T) {
+	base := func() *Config {
+		c := &Config{
+			Network: Network{Bridge: "sh-test", ID: "test"},
+			Ghosts:  map[string]Ghost{"bot": {Name: "Bot"}},
+			Rooms:   map[string]Room{"chat": {Name: "Chat", Kind: KindChat, Ghosts: []string{"bot"}}},
+		}
+		c.applyDefaults()
+		return c
+	}
+	c := base()
+	c.Progress.Mode = "sometimes"
+	if err := c.Validate(); err == nil {
+		t.Fatal("an unknown progress mode was accepted")
+	}
+	c = base()
+	c.Progress.Mode = ProgressEdits
+	c.Progress.Interval = Duration(10 * time.Millisecond)
+	if err := c.Validate(); err == nil {
+		t.Fatal("a 10ms edit interval was accepted")
+	}
+	c = base()
+	c.Progress.Mode = ProgressEdits
+	c.Progress.Interval = Duration(time.Second)
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a sane progress block was rejected: %v", err)
+	}
+}
+
+// Reasoning levels are a naming convention, and the only two things that can
+// go wrong with one are reading a suffix that is not there and reading the
+// wrong one.
+func TestReasoningSplit(t *testing.T) {
+	r := Reasoning{Enabled: true, Levels: []ReasoningLevel{
+		{Name: "Think", IDs: []string{"think", "t"}, Suffix: ":t"},
+		{Name: "Medium", IDs: []string{"medium", "m"}, Suffix: ":m"},
+		{Name: "Extra Extra", IDs: []string{"xx"}, Suffix: ":xl"},
+		{Name: "Extra High", IDs: []string{"extra", "x"}, Suffix: ":x"},
+	}}
+	for _, tc := range []struct {
+		model string
+		base  string
+		level string
+	}{
+		{"qwen38", "qwen38", ""},
+		{"qwen38:m", "qwen38", "Medium"},
+		{"qwen38:t", "qwen38", "Think"},
+		// The longest suffix wins, or ":xl" would read as ":x" plus a stray l.
+		{"qwen38:xl", "qwen38", "Extra Extra"},
+		{"qwen38:x", "qwen38", "Extra High"},
+		// A suffix nobody declared is part of the id, not a level.
+		{"qwen38:z", "qwen38:z", ""},
+	} {
+		base, level := r.Split(tc.model)
+		name := ""
+		if level != nil {
+			name = level.Name
+		}
+		if base != tc.base || name != tc.level {
+			t.Errorf("Split(%q) = %q/%q, want %q/%q", tc.model, base, name, tc.base, tc.level)
+		}
+	}
+	// Every id selects its level, whatever the case, and the first one is the
+	// canonical one.
+	for _, id := range []string{"extra", "x", "EXTRA", "X"} {
+		level, ok := r.Level(id)
+		if !ok || level.Name != "Extra High" {
+			t.Errorf("Level(%q) did not find Extra High", id)
+		} else if level.ID() != "extra" {
+			t.Errorf("canonical id = %q, want extra", level.ID())
+		}
+	}
+	if _, ok := r.Level("off"); ok {
+		t.Error("off is not a level")
+	}
+}
+
+func TestReasoningValidation(t *testing.T) {
+	levels := func(body string) string {
+		return minimal + "\nreasoning:\n  enabled: true\n  levels:\n" + body
+	}
+	for name, body := range map[string]string{
+		"no levels":        minimal + "\nreasoning:\n  enabled: true\n",
+		"no suffix":        levels("    - { name: High, ids: [high] }\n"),
+		"no ids":           levels("    - { name: High, suffix: \":x\" }\n"),
+		"no name":          levels("    - { ids: [high], suffix: \":x\" }\n"),
+		"off is reserved":  levels("    - { name: Off, ids: [off], suffix: \":o\" }\n"),
+		"duplicate id":     levels("    - { name: High, ids: [h], suffix: \":x\" }\n    - { name: Huge, ids: [h], suffix: \":h\" }\n"),
+		"duplicate suffix": levels("    - { name: High, ids: [high], suffix: \":x\" }\n    - { name: Extra, ids: [extra], suffix: \":x\" }\n"),
+		"bad id":           levels("    - { name: High, ids: [\"Very High\"], suffix: \":x\" }\n"),
+	} {
+		if _, err := load(t, body); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+	cfg, err := load(t, levels("    - { name: Low, ids: [low, l], suffix: \":l\" }\n    - { name: Extra High, ids: [extra, x], suffix: \":x\" }\n"))
+	if err != nil {
+		t.Fatalf("valid reasoning config rejected: %v", err)
+	}
+	if base, level := cfg.Reasoning.Split("main:x"); base != "main" || level.Label() != "Extra High" {
+		t.Errorf("loaded levels do not parse a model id: %q %v", base, level)
 	}
 }

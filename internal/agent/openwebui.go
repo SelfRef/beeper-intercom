@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -73,7 +74,15 @@ func (o *openWebUI) Link(convID string) string {
 	if convID == "" {
 		return ""
 	}
-	return strings.TrimSuffix(o.cfg.URL, "/") + "/c/" + convID
+	return o.publicURL() + "/c/" + convID
+}
+
+// publicURL is where a human goes, which is not always where the bridge goes.
+func (o *openWebUI) publicURL() string {
+	if o.cfg.PublicURL != "" {
+		return strings.TrimSuffix(o.cfg.PublicURL, "/")
+	}
+	return strings.TrimSuffix(o.cfg.URL, "/")
 }
 
 func (o *openWebUI) NewConversation(ctx context.Context, seed *Seed) (string, error) {
@@ -111,15 +120,26 @@ func (o *openWebUI) NewConversation(ctx context.Context, seed *Seed) (string, er
 	return resp.ID, nil
 }
 
+// sessionID is the marker that makes Open WebUI treat a request as one of its
+// own: it is what unlocks the built-in tools (web search and friends), and it
+// also moves the turn onto the background-task path, where the HTTP call
+// returns immediately and the answer only arrives over the socket.
+func (o *openWebUI) sessionID(assistantID string) string {
+	if len(o.cfg.Features) == 0 {
+		return ""
+	}
+	return "intercom-" + assistantID
+}
+
 // turnRequest builds the completions body. Streaming and one-shot differ in
 // exactly one field.
-func (o *openWebUI) turnRequest(conv Conversation, turn Turn, assistantID string, stream bool) map[string]any {
+func (o *openWebUI) turnRequest(conv Conversation, turn Turn, assistantID, userMsgID string, stream bool) map[string]any {
 	model := conv.Model
 	if model == "" {
 		model = o.cfg.Model
 	}
 	userMessage := map[string]any{
-		"id":        uuid.NewString(),
+		"id":        userMsgID,
 		"role":      "user",
 		"content":   turn.Text,
 		"timestamp": time.Now().Unix(),
@@ -174,11 +194,29 @@ func (o *openWebUI) turnRequest(conv Conversation, turn Turn, assistantID string
 			body["files"] = metadata
 		}
 	}
-	if len(o.cfg.ToolIDs) > 0 {
-		body["tool_ids"] = o.cfg.ToolIDs
+	// The agent's own tool ids plus whatever toolsets the conversation has
+	// switched on. Open WebUI's backend does NOT apply a model's configured
+	// toolIds to API callers (measured 2026-09-20: it reads them nowhere
+	// outside automations; the web UI is what turns them into tool_ids), so
+	// whatever this bridge does not send, the model does not get.
+	if tools := mergeTools(o.cfg.ToolIDs, turn.Tools); len(tools) > 0 {
+		body["tool_ids"] = tools
 	}
 	if len(o.cfg.ToolServers) > 0 {
 		body["tool_servers"] = o.cfg.ToolServers
+	}
+	if len(o.cfg.Features) > 0 {
+		features := make(map[string]any, len(o.cfg.Features))
+		for _, name := range o.cfg.Features {
+			features[name] = true
+		}
+		body["features"] = features
+		// Only on the streaming path: a session id turns the request into a
+		// background task whose HTTP response is empty, and the one-shot path
+		// has nothing but that response to read.
+		if stream {
+			body["session_id"] = o.sessionID(assistantID)
+		}
 	}
 	return body
 }
@@ -187,17 +225,17 @@ func (o *openWebUI) Send(ctx context.Context, conv Conversation, turn Turn, sink
 	if err := o.attachFiles(ctx, &turn); err != nil {
 		return nil, err
 	}
-	if sink.Delta != nil && !o.cfg.NoStream {
+	if sink.Streams() && !o.cfg.NoStream {
 		return o.sendStreaming(ctx, conv, turn, sink)
 	}
 	return o.sendOneShot(ctx, conv, turn, sink)
 }
 
 func (o *openWebUI) sendOneShot(ctx context.Context, conv Conversation, turn Turn, sink Sink) (*Reply, error) {
-	assistantID := uuid.NewString()
-	if sink.Status != nil {
-		sink.Status("thinking")
-	}
+	assistantID, userMsgID := uuid.NewString(), uuid.NewString()
+	// No phase is reported here on purpose: this path sees nothing until the
+	// whole answer lands, and "thinking" would be a lie for a model with
+	// reasoning switched off. The caller's own "queued" covers the wait.
 	var resp struct {
 		Choices []struct {
 			Message struct {
@@ -207,7 +245,7 @@ func (o *openWebUI) sendOneShot(ctx context.Context, conv Conversation, turn Tur
 		} `json:"choices"`
 		Error any `json:"error"`
 	}
-	if err := o.do(ctx, http.MethodPost, "/api/chat/completions", o.turnRequest(conv, turn, assistantID, false), &resp); err != nil {
+	if err := o.do(ctx, http.MethodPost, "/api/chat/completions", o.turnRequest(conv, turn, assistantID, userMsgID, false), &resp); err != nil {
 		return nil, err
 	}
 	if resp.Error != nil {
@@ -225,7 +263,7 @@ func (o *openWebUI) sendOneShot(ctx context.Context, conv Conversation, turn Tur
 		text = "*No answer — the model returned only its reasoning:*\n\n" +
 			resp.Choices[0].Message.ReasoningContent
 	}
-	return &Reply{Text: text, Parent: assistantID, Link: o.Link(conv.ID)}, nil
+	return &Reply{Text: text, Parent: assistantID, UserMessage: userMsgID, Link: o.Link(conv.ID)}, nil
 }
 
 // sendStreaming runs the turn as Open WebUI's background task. The HTTP
@@ -235,28 +273,45 @@ func (o *openWebUI) sendOneShot(ctx context.Context, conv Conversation, turn Tur
 // polling the chat otherwise (which, on 0.11.3, only ever sees the finished
 // answer — see socketio.go).
 func (o *openWebUI) sendStreaming(ctx context.Context, conv Conversation, turn Turn, sink Sink) (*Reply, error) {
-	assistantID := uuid.NewString()
-	if sink.Status != nil {
-		sink.Status("thinking")
-	}
+	assistantID, userMsgID := uuid.NewString(), uuid.NewString()
+	// The phase stays at the caller's "queued" until the backend says what it
+	// is doing. Claiming "thinking" up front marks the prompt-processing wait
+	// as reasoning, which is wrong whenever reasoning is off — and that wait
+	// is exactly when the model is NOT thinking.
 
+	submit := func(ctx context.Context) error {
+		return o.do(ctx, http.MethodPost, "/api/chat/completions",
+			o.turnRequest(conv, turn, assistantID, userMsgID, true), nil)
+	}
+	reply, err := o.awaitAnswer(ctx, conv, assistantID, sink, submit)
+	if reply != nil {
+		reply.UserMessage = userMsgID
+	}
+	return reply, err
+}
+
+// awaitAnswer submits a turn (a new one, or the resumption of one that stopped
+// to ask a question) and collects the answer: over the socket when a session
+// token is configured, by polling the chat otherwise.
+func (o *openWebUI) awaitAnswer(ctx context.Context, conv Conversation, assistantID string, sink Sink, submit func(context.Context) error) (*Reply, error) {
 	if token := o.cfg.SocketToken(); token != "" {
 		socket, err := dialOWUISocket(ctx, o.cfg.URL, token)
 		if err != nil {
 			o.log.Warn().Err(err).Msg("Socket.io unavailable; falling back to polling")
 		} else {
 			defer socket.Close()
-			return o.streamViaSocket(ctx, socket, conv, turn, assistantID, sink)
+			return o.streamViaSocket(ctx, socket, conv, assistantID, sink, submit)
 		}
 	}
 
 	requestDone := make(chan error, 1)
 	go func() {
-		requestDone <- o.do(ctx, http.MethodPost, "/api/chat/completions", o.turnRequest(conv, turn, assistantID, true), nil)
+		requestDone <- submit(ctx)
 	}()
 
 	var acc accumulator
 	var lastVisible, rawContent string
+	var polledAsk *Ask
 	// Once the request has returned, the task is over, but the last flush and
 	// the done flag can lag behind it by a moment. A few more polls catch
 	// them; after that whatever is there is the answer.
@@ -274,7 +329,12 @@ func (o *openWebUI) sendStreaming(ctx context.Context, conv Conversation, turn T
 				return nil, err
 			}
 			requestDone = nil
-			graceLeft = gracePolls
+			if o.sessionID(assistantID) == "" {
+				graceLeft = gracePolls
+			}
+			// With a session id the response means "accepted", not
+			// "finished" (see turnRequest), so the poll keeps going until the
+			// stored message says done — or the context gives up.
 		case <-ticker.C:
 		}
 
@@ -293,13 +353,19 @@ func (o *openWebUI) sendStreaming(ctx context.Context, conv Conversation, turn T
 			rawContent = msg.Content
 			visible := StripDetails(msg.Content)
 			if delta, ok := acc.delta(visible); ok {
-				if sink.Status != nil && lastVisible == "" {
-					sink.Status("generating")
+				if lastVisible == "" {
+					sink.Report("generating")
 				}
-				sink.Delta(delta)
+				sink.Push(delta)
 			}
 			lastVisible = visible
 			if msg.Done {
+				break
+			}
+			// A turn that stopped to ask something never sets done: the
+			// questions staged on the message are what says it is over.
+			if msg.Ask != nil {
+				polledAsk = msg.Ask
 				break
 			}
 		}
@@ -317,20 +383,23 @@ func (o *openWebUI) sendStreaming(ctx context.Context, conv Conversation, turn T
 		// an empty bubble.
 		text = "*No answer — the model returned only its reasoning.*"
 	}
-	return &Reply{Text: text, Parent: assistantID, Link: o.Link(conv.ID)}, nil
+	return o.finish(ctx, conv, assistantID, text, nil, polledAsk)
 }
 
 // streamViaSocket consumes the turn's events from the socket: text deltas as
 // they are generated, and the terminal chat:completion. Reasoning deltas are
 // skipped — they are the model thinking, not the answer.
-func (o *openWebUI) streamViaSocket(ctx context.Context, socket *owuiSocket, conv Conversation, turn Turn, assistantID string, sink Sink) (*Reply, error) {
+func (o *openWebUI) streamViaSocket(ctx context.Context, socket *owuiSocket, conv Conversation, assistantID string, sink Sink, submit func(context.Context) error) (*Reply, error) {
 	requestDone := make(chan error, 1)
 	go func() {
-		requestDone <- o.do(ctx, http.MethodPost, "/api/chat/completions", o.turnRequest(conv, turn, assistantID, true), nil)
+		requestDone <- submit(ctx)
 	}()
 
 	var text strings.Builder
 	var acc accumulator
+	var phase phaseTracker
+	var usage *Usage
+	var asked *Ask
 	done := make(chan error, 1)
 	go func() {
 		done <- socket.events(ctx, func(name string, payload json.RawMessage) bool {
@@ -345,21 +414,43 @@ func (o *openWebUI) streamViaSocket(ctx context.Context, socket *owuiSocket, con
 			_ = json.Unmarshal(evt.Data.Data, &inner)
 			switch evt.Data.Type {
 			case "response:completion":
+				switch {
+				case strings.HasSuffix(inner.Type, "reasoning_text.delta"):
+					// Reasoning is not the answer and never reaches the bubble,
+					// but it is the difference between "stuck" and "thinking".
+					phase.to(sink, "thinking")
+				case inner.Type == "response.output_item.added" && inner.Item.Type == "function_call":
+					phase.to(sink, toolPhase(inner.Item.Name))
+				}
 				if strings.HasSuffix(inner.Type, "output_text.delta") && inner.Delta != "" {
-					if sink.Status != nil && text.Len() == 0 {
-						sink.Status("generating")
-					}
+					phase.to(sink, "writing")
 					text.WriteString(inner.Delta)
 					acc.seen = text.String()
-					sink.Delta(inner.Delta)
+					sink.Push(inner.Delta)
 				}
 			case "chat:completion":
+				// A turn that stopped to ask something ends HERE, with the
+				// questions in the output and no done flag. Waiting for one
+				// would leave the ghost typing until the context gave up.
+				if staged, err := askFromOutput(inner.Output, assistantID); err == nil && staged != nil {
+					asked = staged
+					return false
+				}
+				if inner.Usage != nil {
+					usage = &Usage{
+						PromptTokens:     inner.Usage.PromptTokens,
+						CompletionTokens: inner.Usage.CompletionTokens,
+						CachedTokens:     inner.Usage.PromptTokensDetails.CachedTokens,
+						PromptPerSecond:  inner.Usage.PromptPerSecond,
+						TokensPerSecond:  inner.Usage.PredictedPerSecond,
+					}
+				}
 				// The non-delta path carries the whole content so far.
 				var content string
 				if json.Unmarshal(inner.Content, &content) == nil && content != "" {
 					if delta, ok := acc.delta(StripDetails(content)); ok {
 						text.WriteString(delta)
-						sink.Delta(delta)
+						sink.Push(delta)
 					}
 				}
 				if inner.Done {
@@ -372,6 +463,13 @@ func (o *openWebUI) streamViaSocket(ctx context.Context, socket *owuiSocket, con
 		})
 	}()
 
+	// Which signal means "the turn is over" depends on how it was submitted.
+	// Without a session id the HTTP call blocks for the whole run, so its
+	// return is the end and the terminal socket event is a moment behind it.
+	// With one, Open WebUI runs the turn as a background task and answers the
+	// HTTP call immediately — there the socket is the only signal, and
+	// treating the response as the end would cut every answer short.
+	background := o.sessionID(assistantID) != "" // streaming path: see turnRequest
 	var requestErr error
 	requestFinished := false
 	for {
@@ -383,6 +481,10 @@ func (o *openWebUI) streamViaSocket(ctx context.Context, socket *owuiSocket, con
 				return nil, requestErr
 			}
 			requestFinished = true
+			if background {
+				// Accepted, not finished: keep reading the socket.
+				continue
+			}
 			// The task is over; the terminal event is at most a moment behind.
 			select {
 			case <-done:
@@ -414,7 +516,7 @@ func (o *openWebUI) streamViaSocket(ctx context.Context, socket *owuiSocket, con
 			final = "*No answer — the model returned only its reasoning.*"
 		}
 	}
-	return &Reply{Text: final, Parent: assistantID, Link: o.Link(conv.ID)}, nil
+	return o.finish(ctx, conv, assistantID, final, usage, asked)
 }
 
 // chatMessage is the slice of a stored message the streaming loop reads.
@@ -422,6 +524,9 @@ type chatMessage struct {
 	Content string
 	Done    bool
 	Error   string
+	// Ask is a staged question: the turn is over and waiting for me, even
+	// though Done is false.
+	Ask *Ask
 }
 
 // assistantMessage reads one message out of the chat, with the live
@@ -431,9 +536,10 @@ func (o *openWebUI) assistantMessage(ctx context.Context, chatID, messageID stri
 		Chat struct {
 			History struct {
 				Messages map[string]struct {
-					Content string          `json:"content"`
-					Done    bool            `json:"done"`
-					Error   json.RawMessage `json:"error"`
+					Content string           `json:"content"`
+					Done    bool             `json:"done"`
+					Error   json.RawMessage  `json:"error"`
+					Output  []owuiOutputItem `json:"output"`
 				} `json:"messages"`
 			} `json:"history"`
 		} `json:"chat"`
@@ -446,6 +552,9 @@ func (o *openWebUI) assistantMessage(ctx context.Context, chatID, messageID stri
 		return nil, nil
 	}
 	msg := &chatMessage{Content: raw.Content, Done: raw.Done}
+	if ask, err := askFromOutput(raw.Output, messageID); err == nil {
+		msg.Ask = ask
+	}
 	if len(raw.Error) > 0 && string(raw.Error) != "null" {
 		var structured struct {
 			Content string `json:"content"`
@@ -493,6 +602,177 @@ func (o *openWebUI) attachFiles(ctx context.Context, turn *Turn) error {
 
 // Transcribe sends a voice message through Open WebUI's STT, which converts
 // and forwards it to whatever engine the instance is configured with.
+// Ask answers one question with no chat behind it: no chat_id, so Open WebUI
+// stores nothing, the running conversation is untouched and the model sees
+// only what was asked. This is /btw.
+func (o *openWebUI) Ask(ctx context.Context, model, question string) (string, error) {
+	if model == "" {
+		model = o.cfg.Model
+	}
+	body := map[string]any{
+		"model":    model,
+		"stream":   false,
+		"messages": []map[string]string{{"role": "user", "content": question}},
+	}
+	if tools := o.cfg.ToolIDs; len(tools) > 0 {
+		body["tool_ids"] = tools
+	}
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error any `json:"error"`
+	}
+	if err := o.do(ctx, http.MethodPost, "/api/chat/completions", body, &resp); err != nil {
+		return "", err
+	}
+	if resp.Error != nil {
+		return "", fmt.Errorf("open webui: %v", resp.Error)
+	}
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("open webui returned no choices")
+	}
+	text := StripDetails(resp.Choices[0].Message.Content)
+	if text == "" {
+		text = "*No answer.*"
+	}
+	return text, nil
+}
+
+// Share publishes the conversation and opens the link to anyone who has it.
+// Two calls: the share itself, then the access grant — a fresh share is
+// readable by the account that made it until an `anyone` grant says otherwise.
+func (o *openWebUI) Share(ctx context.Context, convID string) (string, error) {
+	if convID == "" {
+		return "", fmt.Errorf("no conversation to share")
+	}
+	var shared struct {
+		ShareID string `json:"share_id"`
+	}
+	if err := o.do(ctx, http.MethodPost, "/api/v1/chats/"+convID+"/share", map[string]any{}, &shared); err != nil {
+		return "", err
+	}
+	if shared.ShareID == "" {
+		return "", fmt.Errorf("open webui returned no share id")
+	}
+	grants := map[string]any{"access_grants": []map[string]any{
+		{"principal_type": "anyone", "principal_id": "*", "permission": "read"},
+	}}
+	if err := o.do(ctx, http.MethodPost, "/api/v1/chats/shared/"+convID+"/access/update", grants, nil); err != nil {
+		return "", fmt.Errorf("shared, but could not open it to everyone: %w", err)
+	}
+	return o.publicURL() + "/s/" + shared.ShareID, nil
+}
+
+// Undo deletes one exchange from the chat. Open WebUI's own endpoint removes
+// the message and its direct children — my question and the answers under it —
+// re-parents anything below, and repairs the chat's current message id, which
+// is exactly what taking back the last turn means. Rewinding the parent
+// pointer alone would leave the exchange readable in the web UI.
+func (o *openWebUI) Undo(ctx context.Context, convID, userMessageID string) error {
+	if convID == "" || userMessageID == "" {
+		return ErrUnsupported
+	}
+	return o.do(ctx, http.MethodDelete, "/api/v1/chats/"+convID+"/messages/"+userMessageID, nil, nil)
+}
+
+// Compact asks Open WebUI to summarise the branch in place: the conversation
+// keeps its id, its link and its recent turns, and everything older becomes a
+// summary the model still sees. Open WebUI does this automatically past
+// chat.context_compaction.token_threshold — this is the same thing on demand.
+func (o *openWebUI) Compact(ctx context.Context, convID string) (string, error) {
+	if convID == "" {
+		return "", fmt.Errorf("no conversation to compact")
+	}
+	var resp struct {
+		Compacted    bool   `json:"compacted"`
+		Reason       string `json:"reason"`
+		Dropped      int    `json:"dropped_messages"`
+		Kept         int    `json:"kept_messages"`
+		ContextUsage *struct {
+			Tokens    int `json:"tokens"`
+			Threshold int `json:"threshold"`
+			Percent   int `json:"percent"`
+		} `json:"context_usage"`
+	}
+	if err := o.do(ctx, http.MethodPost, "/api/v1/chats/"+convID+"/compact", map[string]any{}, &resp); err != nil {
+		return "", err
+	}
+	if !resp.Compacted {
+		switch resp.Reason {
+		case "disabled":
+			return "", fmt.Errorf("context compaction is switched off in Open WebUI")
+		case "too_short", "empty":
+			return "Nothing to compact yet — the conversation is still short.", nil
+		default:
+			return "Nothing was compacted.", nil
+		}
+	}
+	out := fmt.Sprintf("Compacted: %d messages summarised, %d kept.", resp.Dropped, resp.Kept)
+	if u := resp.ContextUsage; u != nil && u.Threshold > 0 {
+		out += fmt.Sprintf(" Context now %d%% of %s.", u.Percent, formatTokens(u.Threshold))
+	}
+	return out, nil
+}
+
+// ContextUsage reads how full the conversation is. The chat endpoint reports
+// it, so this costs one GET and no model call.
+func (o *openWebUI) ContextUsage(ctx context.Context, convID string) (string, error) {
+	if convID == "" {
+		return "", ErrUnsupported
+	}
+	var resp struct {
+		ContextUsage *struct {
+			Tokens    int `json:"tokens"`
+			Threshold int `json:"threshold"`
+			Percent   int `json:"percent"`
+		} `json:"context_usage"`
+	}
+	if err := o.do(ctx, http.MethodGet, "/api/v1/chats/"+convID, nil, &resp); err != nil {
+		return "", err
+	}
+	if resp.ContextUsage == nil || resp.ContextUsage.Threshold == 0 {
+		return "", ErrUnsupported
+	}
+	return fmt.Sprintf("%d%% of %s (compacts automatically past that)",
+		resp.ContextUsage.Percent, formatTokens(resp.ContextUsage.Threshold)), nil
+}
+
+// formatTokens prints a token budget the way it is usually spoken.
+func formatTokens(n int) string {
+	if n >= 1000 && n%1000 == 0 {
+		return fmt.Sprintf("%dk", n/1000)
+	}
+	if n >= 1000 {
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	}
+	return fmt.Sprint(n)
+}
+
+// Models lists the ids Open WebUI will accept, which is every model the key
+// can see — base models and workspace presets alike.
+func (o *openWebUI) Models(ctx context.Context) ([]string, error) {
+	var resp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := o.do(ctx, http.MethodGet, "/api/models", nil, &resp); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(resp.Data))
+	for _, m := range resp.Data {
+		if m.ID != "" {
+			out = append(out, m.ID)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 func (o *openWebUI) Transcribe(ctx context.Context, att Attachment) (string, error) {
 	var resp struct {
 		Text string `json:"text"`
@@ -638,4 +918,34 @@ func trim(s string) string {
 		return s[:400] + "…"
 	}
 	return s
+}
+
+// phaseTracker reports a phase change to the sink once, not once per token.
+type phaseTracker struct {
+	last string
+}
+
+func (p *phaseTracker) to(sink Sink, phase string) {
+	if phase == "" || phase == p.last {
+		return
+	}
+	p.last = phase
+	sink.Report(phase)
+}
+
+// webToolHints are the substrings that make a tool call somebody else's
+// latency: a fetch over the network, not a local lookup. Matching is by name
+// because that is all the event carries, and a false "web" is a better guess
+// than a false "local tool" for something called "search".
+var webToolHints = []string{"web", "search", "fetch", "browse", "crawl", "scrape", "url", "http"}
+
+// toolPhase classifies a tool call for the progress marker.
+func toolPhase(name string) string {
+	lower := strings.ToLower(name)
+	for _, hint := range webToolHints {
+		if strings.Contains(lower, hint) {
+			return "web"
+		}
+	}
+	return "tools"
 }

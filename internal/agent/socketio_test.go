@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -105,9 +106,27 @@ func TestOWUISocketRefusesBadToken(t *testing.T) {
 // null (as Open WebUI does), the deltas arrive on the socket, and the stored
 // message is read back as the authoritative answer.
 func TestOpenWebUIStreamsViaSocket(t *testing.T) {
+	// The completions handler, the socket script and the chat read all touch
+	// the assistant id from different goroutines, so it needs a lock of its
+	// own — the race detector is right about that even in a fake.
+	var idMu sync.Mutex
 	var assistantID string
+	setAssistantID := func(id string) {
+		idMu.Lock()
+		assistantID = id
+		idMu.Unlock()
+	}
+	getAssistantID := func() string {
+		idMu.Lock()
+		defer idMu.Unlock()
+		return assistantID
+	}
 	socket := fakeOWUISocket(t, "jwt-1", func(send func(string)) {
-		for i := 0; i < 20 && assistantID == ""; i++ {
+		var assistantID string
+		for i := 0; i < 20; i++ {
+			if assistantID = getAssistantID(); assistantID != "" {
+				break
+			}
 			time.Sleep(20 * time.Millisecond)
 		}
 		for _, piece := range []string{"GRA", "NITE"} {
@@ -120,12 +139,13 @@ func TestOpenWebUIStreamsViaSocket(t *testing.T) {
 	mux.HandleFunc("/api/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		_ = decodeJSON(r, &body)
-		assistantID, _ = body["id"].(string)
+		id, _ := body["id"].(string)
+		setAssistantID(id)
 		time.Sleep(150 * time.Millisecond)
 		_, _ = w.Write([]byte("null"))
 	})
 	mux.HandleFunc("/api/v1/chats/chat-1", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"chat":{"history":{"messages":{"` + assistantID + `":{"content":"GRANITE","done":true}}}}}`))
+		_, _ = w.Write([]byte(`{"chat":{"history":{"messages":{"` + getAssistantID() + `":{"content":"GRANITE","done":true}}}}}`))
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()

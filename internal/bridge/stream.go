@@ -46,8 +46,9 @@ const (
 	// streamFlush bounds how often deltas go out: tokens arrive faster than a
 	// phone wants to repaint, and each update is a to-device event.
 	streamFlush = 150 * time.Millisecond
-	// streamPlaceholder is what a client without stream support sees until
-	// the final edit lands.
+	// streamPlaceholder is the anchor body when the first chunk of the answer
+	// is empty. It should almost never be seen: the anchor normally opens
+	// with real text.
 	streamPlaceholder = "…"
 	// Descriptor and subscription lifetimes, matching beeperstream's defaults.
 	descriptorExpiry  = 30 * time.Minute
@@ -86,6 +87,22 @@ type streamer struct {
 	devices map[string]id.DeviceID // ghost key -> device
 }
 
+// StreamOptions is how a running answer is rendered. The two renderings are
+// independent on purpose: Deltas is the protocol-correct one (no client
+// painted it when this was measured, 2026-09-20), Edits is the one that is
+// actually visible today, and an installation can run either, both or neither.
+type StreamOptions struct {
+	// Edits rewrites the anchor with the answer so far, every Interval.
+	Edits bool
+	// Deltas publishes com.beeper.stream to-device updates to subscribers.
+	Deltas bool
+	// Interval is the edit cadence; ignored without Edits.
+	Interval time.Duration
+	// Suffix marks a partial rendering as unfinished ("…"). It is never part
+	// of the committed answer.
+	Suffix string
+}
+
 // Stream is one live answer.
 type Stream struct {
 	b        *Bridge
@@ -93,17 +110,51 @@ type Stream struct {
 	ghostKey string
 	EventID  id.EventID
 	opts     SendOptions
+	prog     StreamOptions
 
-	mu      sync.Mutex
-	pending strings.Builder
-	timer   *time.Timer
-	closed  bool
-	ctx     context.Context
+	mu       sync.Mutex
+	pending  strings.Builder
+	full     strings.Builder // the whole answer so far, for the progressive edits
+	sentText string          // what the last edit committed
+	timer    *time.Timer
+	closed   bool
+	done     chan struct{}
+	ctx      context.Context
+
+	// editMu serialises the edits, so the final one cannot land before an
+	// interim one that is still in flight.
+	editMu sync.Mutex
+	// edits are the event ids of every edit sent for this anchor. An edit is
+	// its own room event, and redacting the anchor does not redact it — a
+	// client that has applied one goes on showing it. /undo needs the list.
+	edits []id.EventID
 }
 
-// StartStream sends the anchor message and registers the stream. Deltas go out
-// with Push; the answer is committed with Finish.
-func (b *Bridge) StartStream(ctx context.Context, roomID id.RoomID, ghostKey string, opts SendOptions) (*Stream, error) {
+// Events is every event this stream put in the room: the anchor first, then
+// the edits that grew it.
+func (s *Stream) Events() []id.EventID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]id.EventID, 0, len(s.edits)+1)
+	out = append(out, s.EventID)
+	return append(out, s.edits...)
+}
+
+// recordEdit remembers an edit event, ignoring the ones that failed to send.
+func (s *Stream) recordEdit(eventID id.EventID, err error) {
+	if err != nil || eventID == "" {
+		return
+	}
+	s.mu.Lock()
+	s.edits = append(s.edits, eventID)
+	s.mu.Unlock()
+}
+
+// StartStream sends the anchor message and registers the stream. The anchor
+// carries the first chunk of the answer, so the bubble starts with text rather
+// than a placeholder. Later chunks go in with Push; the answer is committed
+// with Finish.
+func (b *Bridge) StartStream(ctx context.Context, roomID id.RoomID, ghostKey string, opts SendOptions, body string, prog StreamOptions) (*Stream, error) {
 	deviceID, err := b.streamDevice(ctx, ghostKey)
 	if err != nil {
 		return nil, err
@@ -114,9 +165,12 @@ func (b *Bridge) StartStream(ctx context.Context, roomID id.RoomID, ghostKey str
 		Type:     streamType,
 		ExpiryMS: descriptorExpiry.Milliseconds(),
 	}
+	if strings.TrimSpace(body) == "" {
+		body = streamPlaceholder
+	}
 	content := &event.MessageEventContent{
 		MsgType:      event.MsgText,
-		Body:         streamPlaceholder,
+		Body:         body + prog.Suffix,
 		BeeperStream: descriptor,
 	}
 	applyRelations(content, opts)
@@ -133,7 +187,48 @@ func (b *Bridge) StartStream(ctx context.Context, roomID id.RoomID, ghostKey str
 	}
 	b.streams.mu.Unlock()
 	b.log.Debug().Str("event_id", resp.EventID.String()).Msg("Stream opened")
-	return &Stream{b: b, key: key, ghostKey: ghostKey, EventID: resp.EventID, opts: opts, ctx: ctx}, nil
+	s := &Stream{
+		b: b, key: key, ghostKey: ghostKey, EventID: resp.EventID, opts: opts, prog: prog, ctx: ctx,
+		sentText: body,
+		done:     make(chan struct{}),
+	}
+	s.full.WriteString(body)
+	if prog.Edits {
+		go s.editLoop()
+	}
+	return s, nil
+}
+
+// editLoop rewrites the anchor with the answer so far. It is the part the user
+// actually sees; the to-device deltas below are the protocol-correct version
+// of the same thing, kept for the day a client honours them.
+func (s *Stream) editLoop() {
+	ticker := time.NewTicker(s.prog.Interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			text := s.full.String()
+			skip := s.closed || text == "" || text == s.sentText
+			if !skip {
+				s.sentText = text
+			}
+			s.mu.Unlock()
+			if skip {
+				continue
+			}
+			s.editMu.Lock()
+			edit, err := s.b.SendEdit(s.ctx, s.key.roomID, s.ghostKey, s.EventID, text+s.prog.Suffix, "")
+			s.editMu.Unlock()
+			s.recordEdit(edit, err)
+			if err != nil {
+				s.b.log.Debug().Err(err).Msg("Progressive edit failed")
+			}
+		}
+	}
 }
 
 // Push queues generated text. Deltas are coalesced for streamFlush before they
@@ -145,6 +240,10 @@ func (s *Stream) Push(text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
+		return
+	}
+	s.full.WriteString(text)
+	if !s.prog.Deltas {
 		return
 	}
 	s.pending.WriteString(text)
@@ -162,8 +261,11 @@ func (s *Stream) flush() {
 	}
 	delta := s.pending.String()
 	s.pending.Reset()
+	deltas := s.prog.Deltas
 	s.mu.Unlock()
-	s.b.publishDelta(s.ctx, s.key, delta)
+	if deltas {
+		s.b.publishDelta(s.ctx, s.key, delta)
+	}
 }
 
 // Finish commits the answer as an edit of the anchor and closes the stream.
@@ -173,16 +275,22 @@ func (s *Stream) Finish(ctx context.Context, body, formatted string) error {
 	if body == "" {
 		body = streamPlaceholder
 	}
-	_, err := s.b.SendEdit(ctx, s.key.roomID, s.ghostKey, s.EventID, body, formatted)
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	edit, err := s.b.SendEdit(ctx, s.key.roomID, s.ghostKey, s.EventID, body, formatted)
+	s.recordEdit(edit, err)
 	return err
 }
 
-// Abort closes the stream and removes the anchor: nothing to show, so nothing
-// should be left behind.
+// Abort closes the stream and removes everything it put in the room: nothing
+// to show, so nothing should be left behind — the edits included, because an
+// orphaned edit still renders.
 func (s *Stream) Abort(ctx context.Context) {
 	s.close()
-	if err := s.b.Redact(ctx, s.key.roomID, s.ghostKey, s.EventID); err != nil {
-		s.b.log.Debug().Err(err).Msg("Could not remove the stream anchor")
+	for _, eventID := range s.Events() {
+		if err := s.b.Redact(ctx, s.key.roomID, s.ghostKey, eventID); err != nil {
+			s.b.log.Debug().Err(err).Msg("Could not remove a stream event")
+		}
 	}
 }
 
@@ -202,7 +310,8 @@ func (s *Stream) close() {
 	if alreadyClosed {
 		return
 	}
-	if pending != "" {
+	close(s.done)
+	if pending != "" && s.prog.Deltas {
 		s.b.publishDelta(s.ctx, s.key, pending)
 	}
 	s.b.closeStream(s.key)
@@ -268,12 +377,28 @@ func (b *Bridge) handleStreamSubscribe(ctx context.Context, evt *event.Event) {
 }
 
 // sendStreamUpdate is the one to-device call of the protocol.
+//
+// Shape matters to the client: a single update is sent FLAT — the delta keys
+// sit next to room_id/event_id — and only a replay of several buffered updates
+// is wrapped in an `updates` array. That is what mautrix's beeperstream
+// publisher does, and a Beeper client that is handed one delta inside
+// `updates` subscribes, receives, and paints nothing.
 func (b *Bridge) sendStreamUpdate(ctx context.Context, ghostKey string, key streamKey, updates []map[string]any, subs []subscriber) {
-	content := &event.Content{Raw: map[string]any{
+	if len(updates) == 0 {
+		return
+	}
+	raw := map[string]any{
 		"room_id":  key.roomID.String(),
 		"event_id": key.eventID.String(),
-		"updates":  updates,
-	}}
+	}
+	if len(updates) == 1 {
+		for k, v := range updates[0] {
+			raw[k] = v
+		}
+	} else {
+		raw["updates"] = updates
+	}
+	content := &event.Content{Raw: raw}
 	req := &mautrix.ReqSendToDevice{Messages: map[id.UserID]map[id.DeviceID]*event.Content{}}
 	for _, sub := range subs {
 		if req.Messages[sub.userID] == nil {

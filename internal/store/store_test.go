@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -239,5 +240,152 @@ func TestKVRoundTrip(t *testing.T) {
 	found, err := st.GetJSON(ctx, "reg", &out)
 	if err != nil || !found || out.ID != "abc" {
 		t.Errorf("json round trip = %v %v %+v", found, err, out)
+	}
+}
+
+// A turn has to come back with everything /undo needs: the backend handle for
+// the exchange and every room event the answer occupies.
+func TestTurnRoundTrip(t *testing.T) {
+	st, ctx := open(t), context.Background()
+	sess, err := st.CreateSession(ctx, &Session{RoomKey: "chat", Agent: "a", ConvID: "c1", Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := &Turn{
+		EventID:      "$q",
+		SessionID:    sess.ID,
+		UserMsgID:    "user-uuid",
+		ParentID:     "p0",
+		ReplyEvent:   "$a",
+		AnswerEvents: []string{"$a", "$edit1", "$edit2", "$file"},
+		Question:     "why",
+		Usage:        `{"prompt_tokens":3}`,
+	}
+	if err := st.PutTurn(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.LastTurn(ctx, "chat", "")
+	if err != nil || got == nil {
+		t.Fatalf("LastTurn = %v, %v", got, err)
+	}
+	if got.UserMsgID != want.UserMsgID || got.Question != want.Question ||
+		strings.Join(got.AnswerEvents, ",") != strings.Join(want.AnswerEvents, ",") {
+		t.Errorf("round trip lost something: %+v", got)
+	}
+
+	// A turn written before the answer-event list existed still has one event.
+	if err := st.PutTurn(ctx, &Turn{EventID: "$q2", SessionID: sess.ID, ReplyEvent: "$a2"}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := st.Turn(ctx, "$q2")
+	if err != nil || old == nil {
+		t.Fatalf("Turn = %v, %v", old, err)
+	}
+	if len(old.AnswerEvents) != 1 || old.AnswerEvents[0] != "$a2" {
+		t.Errorf("fallback answer events = %v", old.AnswerEvents)
+	}
+
+	// Rewinding gives the turn back, so an undone turn cannot rotate the
+	// conversation out on the turn ceiling.
+	if err := st.AdvanceSession(ctx, sess.ID, "p1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RewindSession(ctx, sess.ID, "p0"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := st.SessionByID(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Turns != 0 || after.ParentID != "p0" {
+		t.Errorf("after rewind: turns = %d, parent = %q", after.Turns, after.ParentID)
+	}
+}
+
+// Bridge messages are tracked only so they can be taken back: by command, by
+// conversation, or by the message that caused them.
+func TestNoticeBookkeeping(t *testing.T) {
+	st, ctx := open(t), context.Background()
+	put := func(id, thread, command string) {
+		if err := st.PutNotice(ctx, &Notice{
+			EventID: id, RoomKey: "chat", ThreadRoot: thread, RoomID: "!r", Ghost: "", CommandEvent: command,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond) // created_at is the ordering key
+	}
+	put("$n1", "", "$help")
+	put("$n2", "", "$help")
+	put("$n3", "", "$status")
+	put("$t1", "$thread", "$status")
+
+	// The newest first, and a thread is its own conversation.
+	last, err := st.Notices(ctx, "chat", "", 1)
+	if err != nil || len(last) != 1 || last[0].EventID != "$n3" {
+		t.Fatalf("last notice = %v (%v)", last, err)
+	}
+	if all, err := st.Notices(ctx, "chat", "", 0); err != nil || len(all) != 3 {
+		t.Fatalf("main timeline = %d notices (%v)", len(all), err)
+	}
+	if thread, err := st.Notices(ctx, "chat", "$thread", 0); err != nil || len(thread) != 1 {
+		t.Fatalf("thread = %d notices (%v)", len(thread), err)
+	}
+
+	// Everything said in answer to one command.
+	forHelp, err := st.NoticesForCommand(ctx, "$help")
+	if err != nil || len(forHelp) != 2 {
+		t.Fatalf("answers to $help = %v (%v)", forHelp, err)
+	}
+
+	if err := st.DeleteNotices(ctx, []string{"$n1", "$n2"}); err != nil {
+		t.Fatal(err)
+	}
+	if left, err := st.Notices(ctx, "chat", "", 0); err != nil || len(left) != 1 {
+		t.Fatalf("after deleting two, %d left (%v)", len(left), err)
+	}
+	// Deleting nothing is not an error: /clean with nothing to clean.
+	if err := st.DeleteNotices(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Whether an edited command may re-run is decided from the commands table, so
+// the two things it has to get right are "which is the newest" and "which
+// conversation was it part of" — and editing one must not change either.
+func TestCommandOrdering(t *testing.T) {
+	st, ctx := open(t), context.Background()
+	put := func(id, body string, session int64) {
+		if err := st.PutCommand(ctx, &Command{
+			EventID: id, RoomKey: "chat", RoomID: "!r", Body: body, SessionID: session,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	put("$c1", "/help", 7)
+	put("$c2", "/status", 7)
+
+	last, err := st.LastCommand(ctx, "chat", "")
+	if err != nil || last == nil || last.EventID != "$c2" {
+		t.Fatalf("last command = %v (%v)", last, err)
+	}
+
+	// Editing the OLD one updates its text but must not promote it to newest,
+	// or an edit of ancient history would look like a correction.
+	put("$c1", "/new", 7)
+	last, err = st.LastCommand(ctx, "chat", "")
+	if err != nil || last.EventID != "$c2" {
+		t.Fatalf("after editing the older command, last = %v (%v)", last, err)
+	}
+	edited, err := st.Command(ctx, "$c1")
+	if err != nil || edited.Body != "/new" {
+		t.Fatalf("edited body = %v (%v)", edited, err)
+	}
+	if edited.SessionID != 7 {
+		t.Errorf("session id = %d, want the one it was typed in", edited.SessionID)
+	}
+	// A thread is its own conversation, so it has its own newest command.
+	if last, err := st.LastCommand(ctx, "chat", "$thread"); err != nil || last != nil {
+		t.Errorf("thread should have no commands yet: %v (%v)", last, err)
 	}
 }

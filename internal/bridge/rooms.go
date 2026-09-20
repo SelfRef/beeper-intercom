@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"go.mau.fi/util/ptr"
@@ -118,7 +119,8 @@ func (b *Bridge) reconcileRooms(ctx context.Context) error {
 		}
 
 		rid := id.RoomID(roomID)
-		hash := hashOf(room.Name, room.Topic, avatar.String(), room.Kind, room.Ghosts, room.Tags, room.Muted, b.conf().Network.Name)
+		hash := hashOf(room.Name, room.Topic, avatar.String(), room.Kind, room.Ghosts, room.Tags,
+			room.Muted, room.DeletePlaceholder, b.conf().Network.Name)
 		if storedHash != hash {
 			if err := b.patchRoom(ctx, key, room, rid, avatar, networkAvatar); err != nil {
 				return fmt.Errorf("patch room %s: %w", key, err)
@@ -152,6 +154,7 @@ func (b *Bridge) createRoom(ctx context.Context, key string, room config.Room, a
 		stateEvent(event.StateElementFunctionalMembers, "", map[string]any{
 			"service_members": []string{b.BotMXID().String()},
 		}),
+		stateEventJSON(event.StateBeeperRoomFeatures, b.bridgeStateKey(), b.roomFeatures(room)),
 	}
 	if !avatar.IsEmpty() {
 		initialState = append(initialState, stateEvent(event.StateRoomAvatar, "", map[string]any{
@@ -228,6 +231,12 @@ func (b *Bridge) patchRoom(ctx context.Context, key string, room config.Room, ro
 	if _, err := bot.SendStateEvent(ctx, roomID, event.StateElementFunctionalMembers, "", map[string]any{
 		"service_members": []string{b.BotMXID().String()},
 	}); err != nil {
+		return err
+	}
+	// What the client may do in this room — and, the reason it is here at all,
+	// whether a redaction leaves a tombstone behind (see features.go).
+	if _, err := bot.SendStateEvent(ctx, roomID, event.StateBeeperRoomFeatures, b.bridgeStateKey(),
+		b.roomFeatures(room)); err != nil {
 		return err
 	}
 	if _, err := bot.SetPowerLevels(ctx, roomID, b.powerLevels(room)); err != nil {
@@ -345,6 +354,20 @@ func stateEvent(evtType event.Type, stateKey string, content map[string]any) *ev
 		StateKey: &stateKey,
 		Content:  event.Content{Raw: content},
 	}
+}
+
+// stateEventJSON is the same for a typed content struct, which has to go
+// through JSON to land in the Raw map createRoom sends.
+func stateEventJSON(evtType event.Type, stateKey string, content any) *event.Event {
+	raw, err := json.Marshal(content)
+	if err != nil {
+		return stateEvent(evtType, stateKey, map[string]any{})
+	}
+	var asMap map[string]any
+	if err := json.Unmarshal(raw, &asMap); err != nil {
+		return stateEvent(evtType, stateKey, map[string]any{})
+	}
+	return stateEvent(evtType, stateKey, asMap)
 }
 
 // SetMuted mutes or unmutes a room for the account owner. Mute is per-user

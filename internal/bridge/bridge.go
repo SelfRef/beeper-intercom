@@ -396,7 +396,11 @@ func (b *Bridge) pingLoop(ctx context.Context, interval, timeout time.Duration) 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if b.as == nil || !b.as.HasWebsocket() {
+			// b.connected, not as.HasWebsocket(): mautrix keeps that flag in
+			// an unsynchronised field that the websocket goroutine writes as
+			// it connects, and this loop reads it from another goroutine.
+			// The bridge already tracks the same thing under its own lock.
+			if b.as == nil || !b.Connected() {
 				continue
 			}
 			pingCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -454,7 +458,7 @@ func (b *Bridge) postLoginState(ctx context.Context) {
 	// and rejects CONNECTED ("Unknown state CONNECTED"); per-login states are
 	// `bridge_status` websocket commands, and they are what fills the
 	// account list.
-	if b.as == nil || !b.as.HasWebsocket() {
+	if b.as == nil || !b.Connected() {
 		return
 	}
 	if err := b.as.SendWebsocket(ctx, &appservice.WebsocketRequest{Command: "bridge_status", Data: state}); err != nil {
@@ -487,10 +491,13 @@ func (b *Bridge) GhostMXID(key string) id.UserID {
 	return id.NewUserID(fmt.Sprintf("%s_%s", b.conf().Network.Bridge, key), b.conf().Matrix.HomeserverDomain)
 }
 
-// BotMXID is the bridge bot: the sender of room state and the only user that
-// can render the dim, centred notice style (and only in a bot room). It is
-// empty until registration has happened, which is observable through the
-// admin API while the bridge is still trying to connect.
+// BotMXID is the bridge bot: the sender of room state, and the only sender
+// whose m.notice renders as dim centred text with no bubble. That style works
+// in ANY room, not only a bridge-bot room (measured 2026-09-20: the same
+// notice from a ghost is an ordinary bubble, from the bot it is centred — in a
+// plain dm portal with no com.beeper.is_bridge_bot_room flag). It is empty
+// until registration has happened, which is observable through the admin API
+// while the bridge is still trying to connect.
 func (b *Bridge) BotMXID() id.UserID {
 	if b.reg == nil {
 		return ""
@@ -502,7 +509,17 @@ func (b *Bridge) BotMXID() id.UserID {
 func (b *Bridge) UserID() id.UserID { return b.userID }
 
 // Intent returns an appservice intent for a ghost key.
-func (b *Bridge) Intent(key string) *appservice.IntentAPI { return b.as.Intent(b.GhostMXID(key)) }
+func (b *Bridge) Intent(key string) *appservice.IntentAPI {
+	if key == BotKey {
+		return b.BotIntent()
+	}
+	return b.as.Intent(b.GhostMXID(key))
+}
+
+// BotKey is the ghost key that means the bridge itself rather than one of its
+// ghosts. Every send path takes a ghost key, and this is how a caller says
+// "this is the bridge speaking, not the network".
+const BotKey = ""
 
 // BotIntent returns the bridge bot's intent.
 func (b *Bridge) BotIntent() *appservice.IntentAPI { return b.as.BotIntent() }
@@ -552,6 +569,17 @@ func (b *Bridge) Connected() bool {
 func (b *Bridge) Registration() *appservice.Registration { return b.reg }
 
 // --- media -----------------------------------------------------------------
+
+// UploadAvatar uploads an image from the config directory and returns its mxc
+// URI, cached so a restart does not re-upload it. The notice profile needs the
+// same thing a ghost does.
+func (b *Bridge) UploadAvatar(ctx context.Context, path string) (string, error) {
+	uri, err := b.uploadFile(ctx, path)
+	if err != nil || uri.IsEmpty() {
+		return "", err
+	}
+	return uri.String(), nil
+}
 
 // uploadFile uploads a local file once and caches the mxc URI: avatars are
 // re-uploaded on every start otherwise, and each upload is a new mxc, which

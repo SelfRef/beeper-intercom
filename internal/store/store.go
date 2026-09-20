@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -150,6 +151,35 @@ CREATE TABLE IF NOT EXISTS polls (
 	closed_at   INTEGER
 );
 
+-- The bridge's own messages: command replies and the notices it posts about
+-- itself. Tracked only so they can be taken back again — /clean, and reacting
+-- to a command to sweep it away with its answer.
+CREATE TABLE IF NOT EXISTS notices (
+	event_id      TEXT PRIMARY KEY,
+	room_key      TEXT NOT NULL,
+	thread_root   TEXT NOT NULL DEFAULT '',
+	room_id       TEXT NOT NULL,
+	ghost         TEXT NOT NULL DEFAULT '',
+	command_event TEXT NOT NULL DEFAULT '',
+	created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notices_slot ON notices (room_key, thread_root, created_at);
+CREATE INDEX IF NOT EXISTS idx_notices_command ON notices (command_event);
+
+-- The commands I have typed, so that editing one can be answered properly:
+-- re-run when it is the newest one in a live conversation, refused when it is
+-- an old one whose answer has already been read and acted on.
+CREATE TABLE IF NOT EXISTS commands (
+	event_id    TEXT PRIMARY KEY,
+	room_key    TEXT NOT NULL,
+	thread_root TEXT NOT NULL DEFAULT '',
+	room_id     TEXT NOT NULL,
+	body        TEXT NOT NULL,
+	session_id  INTEGER NOT NULL DEFAULT 0,
+	created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_commands_slot ON commands (room_key, thread_root, created_at);
+
 -- What the bridge sent in answer to which of my messages, so an edit can
 -- regenerate and a redaction can cancel.
 CREATE TABLE IF NOT EXISTS turns (
@@ -158,6 +188,9 @@ CREATE TABLE IF NOT EXISTS turns (
 	user_msg_id  TEXT NOT NULL DEFAULT '',
 	parent_id    TEXT NOT NULL DEFAULT '',
 	reply_event  TEXT NOT NULL DEFAULT '',
+	answer_events TEXT NOT NULL DEFAULT '',
+	question     TEXT NOT NULL DEFAULT '',
+	usage        TEXT NOT NULL DEFAULT '',
 	created_at   INTEGER NOT NULL
 );
 `
@@ -177,6 +210,19 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	// Columns added after the first release. CREATE TABLE IF NOT EXISTS does
+	// nothing to a table that already exists, so each one is an ALTER that is
+	// allowed to fail as "duplicate column".
+	for _, alter := range []string{
+		`ALTER TABLE turns ADD COLUMN question TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE turns ADD COLUMN usage TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE turns ADD COLUMN answer_events TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migrate: %s: %w", alter, err)
+		}
 	}
 	return &Store{db: db}, nil
 }
@@ -408,6 +454,9 @@ type Session struct {
 	CreatedAt  int64  `json:"created_at"`
 	LastActive int64  `json:"last_active"`
 	ClosedAt   *int64 `json:"closed_at,omitempty"`
+	// Live is set by the listings that care whether a session is the current
+	// one; it is derived from ClosedAt, not stored.
+	Live bool `json:"live,omitempty"`
 }
 
 const sessionCols = `id, room_key, thread_root, agent, conv_id, parent_id, model, title, turns, created_at, last_active, closed_at`
@@ -472,8 +521,26 @@ func (s *Store) AdvanceSession(ctx context.Context, id int64, parentID string) e
 	return err
 }
 
+// RewindSession is AdvanceSession backwards: /undo puts the parent back to
+// where it was before the undone turn and gives the turn count back, so a
+// conversation cannot be rotated out by turns that were taken back.
+func (s *Store) RewindSession(ctx context.Context, id int64, parentID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET parent_id = ?, turns = MAX(turns - 1, 0), last_active = ? WHERE id = ?`,
+		parentID, now(), id)
+	return err
+}
+
 func (s *Store) TouchSession(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET last_active = ? WHERE id = ?`, now(), id)
+	return err
+}
+
+// SetSessionModel changes the model of a running conversation. The backend
+// keeps the branch either way — Open WebUI records a model per message — so a
+// conversation can change its mind about how hard to think halfway through.
+func (s *Store) SetSessionModel(ctx context.Context, id int64, model string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET model = ? WHERE id = ?`, model, id)
 	return err
 }
 
@@ -525,6 +592,16 @@ func (s *Store) AppendTranscript(ctx context.Context, convID, role, content stri
 		`INSERT INTO transcripts (conv_id, idx, role, content, created_at)
 		 VALUES (?, (SELECT COALESCE(MAX(idx), 0) + 1 FROM transcripts WHERE conv_id = ?), ?, ?, ?)`,
 		convID, convID, role, content, now())
+	return err
+}
+
+// TrimTranscript drops the last n entries of a bridge-held transcript, which
+// is what /undo means for a backend that keeps no history of its own.
+func (s *Store) TrimTranscript(ctx context.Context, convID string, n int) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM transcripts WHERE rowid IN (
+			SELECT rowid FROM transcripts WHERE conv_id = ? ORDER BY idx DESC LIMIT ?
+		 )`, convID, n)
 	return err
 }
 
@@ -734,35 +811,321 @@ func (s *Store) AnswerPoll(ctx context.Context, eventID, response string) error 
 	return err
 }
 
+// --- commands (what I typed) -----------------------------------------------
+
+// Command is one command message of mine, with the conversation it belonged
+// to. Kept so an edit of it can be judged: re-runnable, or too late.
+type Command struct {
+	EventID    string
+	RoomKey    string
+	ThreadRoot string
+	RoomID     string
+	Body       string
+	SessionID  int64
+	CreatedAt  int64
+}
+
+const commandCols = `event_id, room_key, thread_root, room_id, body, session_id, created_at`
+
+// PutCommand records a command, or updates the text of one that was edited.
+// created_at is deliberately NOT refreshed: an edited command keeps its place
+// in the order, so editing an old one cannot make it look like the newest.
+func (s *Store) PutCommand(ctx context.Context, c *Command) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO commands (`+commandCols+`) VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(event_id) DO UPDATE SET body = excluded.body, session_id = excluded.session_id`,
+		c.EventID, c.RoomKey, c.ThreadRoot, c.RoomID, c.Body, c.SessionID, now())
+	return err
+}
+
+func scanCommand(scan func(dest ...any) error) (*Command, error) {
+	var c Command
+	if err := scan(&c.EventID, &c.RoomKey, &c.ThreadRoot, &c.RoomID, &c.Body, &c.SessionID, &c.CreatedAt); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (s *Store) Command(ctx context.Context, eventID string) (*Command, error) {
+	c, err := scanCommand(s.db.QueryRowContext(ctx,
+		`SELECT `+commandCols+` FROM commands WHERE event_id = ?`, eventID).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return c, err
+}
+
+// LastCommand is the most recent command in a conversation slot.
+func (s *Store) LastCommand(ctx context.Context, roomKey, threadRoot string) (*Command, error) {
+	c, err := scanCommand(s.db.QueryRowContext(ctx,
+		`SELECT `+commandCols+` FROM commands WHERE room_key = ? AND thread_root = ?
+		  ORDER BY created_at DESC LIMIT 1`, roomKey, threadRoot).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return c, err
+}
+
+// Commands lists the commands in a conversation slot, newest first. since = 0
+// means all of them.
+func (s *Store) Commands(ctx context.Context, roomKey, threadRoot string, since int64) ([]*Command, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+commandCols+` FROM commands
+		  WHERE room_key = ? AND thread_root = ? AND created_at >= ?
+		  ORDER BY created_at DESC`, roomKey, threadRoot, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Command
+	for rows.Next() {
+		c, err := scanCommand(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteCommands(ctx context.Context, eventIDs []string) error {
+	if len(eventIDs) == 0 {
+		return nil
+	}
+	args := make([]any, len(eventIDs))
+	holes := make([]string, len(eventIDs))
+	for i, id := range eventIDs {
+		args[i], holes[i] = id, "?"
+	}
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM commands WHERE event_id IN (`+strings.Join(holes, ",")+`)`, args...)
+	return err
+}
+
+// --- notices (the bridge's own messages) -----------------------------------
+
+// Notice is one message the bridge posted about itself, with the command that
+// caused it when there was one.
+type Notice struct {
+	EventID      string
+	RoomKey      string
+	ThreadRoot   string
+	RoomID       string
+	Ghost        string
+	CommandEvent string
+	CreatedAt    int64
+}
+
+func (s *Store) PutNotice(ctx context.Context, n *Notice) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO notices (event_id, room_key, thread_root, room_id, ghost, command_event, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(event_id) DO NOTHING`,
+		n.EventID, n.RoomKey, n.ThreadRoot, n.RoomID, n.Ghost, n.CommandEvent, now())
+	return err
+}
+
+const noticeCols = `event_id, room_key, thread_root, room_id, ghost, command_event, created_at`
+
+func scanNotices(rows *sql.Rows) ([]*Notice, error) {
+	defer rows.Close()
+	var out []*Notice
+	for rows.Next() {
+		var n Notice
+		if err := rows.Scan(&n.EventID, &n.RoomKey, &n.ThreadRoot, &n.RoomID, &n.Ghost,
+			&n.CommandEvent, &n.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &n)
+	}
+	return out, rows.Err()
+}
+
+// Notices returns the bridge's messages in one conversation slot, newest
+// first. limit <= 0 means all of them.
+func (s *Store) Notices(ctx context.Context, roomKey, threadRoot string, limit int) ([]*Notice, error) {
+	query := `SELECT ` + noticeCols + ` FROM notices WHERE room_key = ? AND thread_root = ? ORDER BY created_at DESC`
+	args := []any{roomKey, threadRoot}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanNotices(rows)
+}
+
+// NoticesSince returns the bridge's messages posted at or after a timestamp —
+// what /clean all sweeps when a conversation is running.
+func (s *Store) NoticesSince(ctx context.Context, roomKey, threadRoot string, since int64) ([]*Notice, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+noticeCols+` FROM notices
+		  WHERE room_key = ? AND thread_root = ? AND created_at >= ?
+		  ORDER BY created_at DESC`, roomKey, threadRoot, since)
+	if err != nil {
+		return nil, err
+	}
+	return scanNotices(rows)
+}
+
+// NoticesForCommand returns everything the bridge said in answer to one
+// message of mine.
+func (s *Store) NoticesForCommand(ctx context.Context, commandEvent string) ([]*Notice, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+noticeCols+` FROM notices WHERE command_event = ? ORDER BY created_at`, commandEvent)
+	if err != nil {
+		return nil, err
+	}
+	return scanNotices(rows)
+}
+
+func (s *Store) DeleteNotices(ctx context.Context, eventIDs []string) error {
+	if len(eventIDs) == 0 {
+		return nil
+	}
+	args := make([]any, len(eventIDs))
+	holes := make([]string, len(eventIDs))
+	for i, id := range eventIDs {
+		args[i], holes[i] = id, "?"
+	}
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM notices WHERE event_id IN (`+strings.Join(holes, ",")+`)`, args...)
+	return err
+}
+
 // --- turns -----------------------------------------------------------------
 
 // Turn links my message to the session and backend ids that answered it.
 type Turn struct {
-	EventID    string
-	SessionID  int64
-	UserMsgID  string
-	ParentID   string
+	EventID   string
+	SessionID int64
+	UserMsgID string
+	ParentID  string
+	// ReplyEvent is the first event of the answer: the one an edit replaces
+	// and a reply points at.
 	ReplyEvent string
+	// AnswerEvents is EVERY room event the answer produced — the anchor, the
+	// interim edits that grew it, the later parts of a split answer, the
+	// attached file. /undo has to redact all of them: in Matrix an edit is its
+	// own event, so redacting the anchor alone leaves the last edit behind and
+	// the client happily goes on rendering it.
+	AnswerEvents []string
+	// Question is what was asked, kept so /retry can ask it again without
+	// reading the room back from the homeserver.
+	Question string
+	// Usage is what the backend reported about the run (tokens, speed) as
+	// compact JSON, for /status. Empty when the backend said nothing.
+	Usage string
 }
 
 func (s *Store) PutTurn(ctx context.Context, t *Turn) error {
+	events := ""
+	if len(t.AnswerEvents) > 0 {
+		raw, err := json.Marshal(t.AnswerEvents)
+		if err != nil {
+			return err
+		}
+		events = string(raw)
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO turns (event_id, session_id, user_msg_id, parent_id, reply_event, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(event_id) DO UPDATE SET reply_event = excluded.reply_event`,
-		t.EventID, t.SessionID, t.UserMsgID, t.ParentID, t.ReplyEvent, now())
+		`INSERT INTO turns (event_id, session_id, user_msg_id, parent_id, reply_event, answer_events, question, usage, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(event_id) DO UPDATE SET reply_event = excluded.reply_event,
+		                                     answer_events = excluded.answer_events,
+		                                     user_msg_id = excluded.user_msg_id,
+		                                     question = excluded.question,
+		                                     usage = excluded.usage`,
+		t.EventID, t.SessionID, t.UserMsgID, t.ParentID, t.ReplyEvent, events, t.Question, t.Usage, now())
 	return err
 }
 
-func (s *Store) Turn(ctx context.Context, eventID string) (*Turn, error) {
+// turnCols and scanTurn keep the two readers in step.
+const turnCols = `event_id, session_id, user_msg_id, parent_id, reply_event, answer_events, question, usage`
+
+func scanTurn(scan func(dest ...any) error) (*Turn, error) {
 	var t Turn
-	err := s.db.QueryRowContext(ctx,
-		`SELECT event_id, session_id, user_msg_id, parent_id, reply_event FROM turns WHERE event_id = ?`, eventID).
-		Scan(&t.EventID, &t.SessionID, &t.UserMsgID, &t.ParentID, &t.ReplyEvent)
+	var events string
+	if err := scan(&t.EventID, &t.SessionID, &t.UserMsgID, &t.ParentID, &t.ReplyEvent, &events, &t.Question, &t.Usage); err != nil {
+		return nil, err
+	}
+	if events != "" {
+		// A turn whose event list cannot be read is not a broken turn; it just
+		// falls back to the one event every turn has.
+		_ = json.Unmarshal([]byte(events), &t.AnswerEvents)
+	}
+	if len(t.AnswerEvents) == 0 && t.ReplyEvent != "" {
+		t.AnswerEvents = []string{t.ReplyEvent}
+	}
+	return &t, nil
+}
+
+func (s *Store) Turn(ctx context.Context, eventID string) (*Turn, error) {
+	t, err := scanTurn(s.db.QueryRowContext(ctx,
+		`SELECT `+turnCols+` FROM turns WHERE event_id = ?`, eventID).Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
-	return &t, err
+	return t, err
+}
+
+// LastTurn is the most recent turn of the live conversation in a room (or
+// thread), which is what /retry asks again and /undo takes back.
+func (s *Store) LastTurn(ctx context.Context, roomKey, threadRoot string) (*Turn, error) {
+	t, err := scanTurn(s.db.QueryRowContext(ctx,
+		`SELECT `+prefixed(turnCols, "t.")+`
+		   FROM turns t
+		   JOIN sessions s ON s.id = t.session_id
+		  WHERE s.room_key = ? AND s.thread_root = ? AND s.closed_at IS NULL
+		  ORDER BY t.created_at DESC LIMIT 1`, roomKey, threadRoot).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return t, err
+}
+
+// prefixed qualifies a column list for a join.
+func prefixed(cols, prefix string) string {
+	parts := strings.Split(cols, ", ")
+	for i, col := range parts {
+		parts[i] = prefix + col
+	}
+	return strings.Join(parts, ", ")
+}
+
+// DeleteTurn forgets one turn. /undo uses it after rewinding the session, so
+// the turn it removed cannot be retried or counted again.
+func (s *Store) DeleteTurn(ctx context.Context, eventID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM turns WHERE event_id = ?`, eventID)
+	return err
+}
+
+// RoomSessions lists a room's conversations, newest first — what /history
+// shows. The live one is included; it is usually the interesting one.
+func (s *Store) RoomSessions(ctx context.Context, roomKey, threadRoot string, limit int) ([]*Session, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT s.id, s.room_key, s.thread_root, s.agent, s.conv_id, s.model, s.turns, s.last_active, s.created_at,
+		        s.closed_at IS NULL
+		   FROM sessions s
+		  WHERE s.room_key = ? AND s.thread_root = ?
+		  ORDER BY s.last_active DESC LIMIT ?`, roomKey, threadRoot, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Session
+	for rows.Next() {
+		var sess Session
+		var live bool
+		if err := rows.Scan(&sess.ID, &sess.RoomKey, &sess.ThreadRoot, &sess.Agent, &sess.ConvID,
+			&sess.Model, &sess.Turns, &sess.LastActive, &sess.CreatedAt, &live); err != nil {
+			return nil, err
+		}
+		sess.Live = live
+		out = append(out, &sess)
+	}
+	return out, rows.Err()
 }
 
 // --- transactions ----------------------------------------------------------

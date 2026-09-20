@@ -43,9 +43,22 @@ type SendOptions struct {
 }
 
 // Markdown renders Markdown to the Matrix HTML subset. Exported because the
-// agent reply path needs exactly the same rendering as a notification.
+// agent reply path needs exactly the same rendering as a notification. HTML in
+// the text is escaped: an answer from a model is not trusted to contain
+// markup.
 func Markdown(text string) (plain, formatted string) {
-	content := format.RenderMarkdown(text, true, false)
+	return render(text, false)
+}
+
+// MarkdownHTML is the same, but passes HTML through — for text the BRIDGE
+// wrote, which needs the parts of the Matrix subset that Markdown has no
+// syntax for (data-mx-color, details/summary).
+func MarkdownHTML(text string) (plain, formatted string) {
+	return render(text, true)
+}
+
+func render(text string, allowHTML bool) (plain, formatted string) {
+	content := format.RenderMarkdown(text, true, allowHTML)
 	if content.FormattedBody == "" {
 		return content.Body, ""
 	}
@@ -355,9 +368,36 @@ func (b *Bridge) React(ctx context.Context, roomID id.RoomID, ghostKey string, t
 }
 
 // Redact removes an event as a ghost.
+// Redact removes an event. The tombstone the client normally draws in its
+// place ("This message has been deleted") is suppressed by a key on the
+// REDACTION event — not by the room's features, which only tell Beeper's own
+// client to add that key when IT redacts something
+// (`getRedactionExtraContent` in the desktop bundle, read 2026-09-20). A
+// bridge has to add it itself, and the room feature is still required: the
+// renderer reads the key, the feature is what makes a client willing to send
+// it, and declaring both keeps the two consistent.
 func (b *Bridge) Redact(ctx context.Context, roomID id.RoomID, ghostKey string, target id.EventID) error {
-	_, err := b.Intent(ghostKey).RedactEvent(ctx, roomID, target)
+	req := mautrix.ReqRedact{}
+	if b.hidesDeletePlaceholder(roomID) {
+		req.Extra = map[string]any{"com.beeper.dont_render_redacted_placeholder": true}
+	}
+	_, err := b.Intent(ghostKey).RedactEvent(ctx, roomID, target, req)
 	return err
+}
+
+// hidesDeletePlaceholder reports whether this room asked for redactions to
+// disappear rather than leave a marker. A room the bridge does not know is
+// treated as one that keeps its markers: silently erasing something in
+// somebody else's room is not the bridge's call.
+func (b *Bridge) hidesDeletePlaceholder(roomID id.RoomID) bool {
+	b.mu.RLock()
+	key, known := b.roomKey[roomID]
+	b.mu.RUnlock()
+	if !known {
+		return false
+	}
+	room, ok := b.conf().Rooms[key]
+	return ok && !room.DeletePlaceholder
 }
 
 // Typing shows the ghost as typing. Beeper expires the indicator, so a long
@@ -388,27 +428,7 @@ func (b *Bridge) SendPoll(ctx context.Context, roomID id.RoomID, ghostKey, quest
 	if len(answers) == 0 {
 		answers = []string{"Yes", "No"}
 	}
-	pollAnswers := make([]map[string]any, 0, len(answers))
-	for _, answer := range answers {
-		pollAnswers = append(pollAnswers, map[string]any{
-			"id":                      answerID(answer),
-			"org.matrix.msc1767.text": []map[string]string{{"mimetype": "text/plain", "body": answer}},
-		})
-	}
-	content := map[string]any{
-		"org.matrix.msc3381.poll.start": map[string]any{
-			"kind":           "org.matrix.msc3381.poll.disclosed",
-			"max_selections": 1,
-			"question": map[string]any{
-				"org.matrix.msc1767.text": []map[string]string{{"mimetype": "text/plain", "body": question}},
-			},
-			"answers": pollAnswers,
-		},
-		// Fallback for anything that does not render polls.
-		"org.matrix.msc1767.text": []map[string]string{
-			{"mimetype": "text/plain", "body": question + "\n" + strings.Join(answers, " / ")},
-		},
-	}
+	content := pollContent(question, answers)
 	if opts.ThreadRoot != "" {
 		content["m.relates_to"] = map[string]any{
 			"rel_type": "m.thread",
@@ -422,15 +442,62 @@ func (b *Bridge) SendPoll(ctx context.Context, roomID id.RoomID, ghostKey, quest
 	return resp.EventID, nil
 }
 
-// ClosePoll ends a poll so the client stops accepting answers.
+// pollTextKey is where a poll keeps its human-readable text, on the event and
+// on every answer.
+const pollTextKey = "org.matrix.msc1767.text"
+
+// pollContent builds the event a poll is, following Beeper's own client
+// (`buildPollStartContent` in the desktop bundle, read 2026-09-20):
+//
+//	{ "org.matrix.msc1767.text": "<question>",
+//	  "org.matrix.msc3381.poll.start": {
+//	    "answers": [{"id": …, "org.matrix.msc1767.text": "<label>"}],
+//	    "kind": …, "max_selections": 1,
+//	    "question": {"org.matrix.msc1767.text": "<question>"} } }
+//
+// The text fields are PLAIN STRINGS. With the extensible-events array of
+// {body, mimetype} the client finds no text at all and draws a poll with a
+// blank question and blank options — measured 2026-09-20, and it stays blank
+// across a restart, so it is the shape and not a cache.
+//
+// `body` is added for clients that do not render polls; it costs nothing in
+// Beeper, which shows the poll and ignores it.
+func pollContent(question string, answers []string) map[string]any {
+	pollAnswers := make([]map[string]any, 0, len(answers))
+	for _, answer := range answers {
+		pollAnswers = append(pollAnswers, map[string]any{
+			"id":        answerID(answer),
+			pollTextKey: answer,
+		})
+	}
+	return map[string]any{
+		pollTextKey: question,
+		"body":      question + "\n" + strings.Join(answers, " / "),
+		"org.matrix.msc3381.poll.start": map[string]any{
+			"kind":           "org.matrix.msc3381.poll.disclosed",
+			"max_selections": 1,
+			"question":       map[string]any{pollTextKey: question},
+			"answers":        pollAnswers,
+		},
+	}
+}
+
+// AnswerID is the id a poll response carries for an answer. A response names
+// ids, not labels, so a caller that has to turn one back into what it offered
+// uses this.
+func AnswerID(answer string) string { return answerID(answer) }
+
+// ClosePoll ends a poll so the client stops accepting answers. An answered
+// question that can still be re-answered is a question whose answer no longer
+// matches what was done with it.
 func (b *Bridge) ClosePoll(ctx context.Context, roomID id.RoomID, ghostKey string, poll id.EventID) error {
 	_, err := b.Intent(ghostKey).SendMessageEvent(ctx, roomID, eventPollEnd, map[string]any{
 		"org.matrix.msc3381.poll.end": map[string]any{},
+		pollTextKey:                   "Poll ended",
 		"m.relates_to": map[string]any{
 			"rel_type": "m.reference",
 			"event_id": poll.String(),
 		},
-		"org.matrix.msc1767.text": []map[string]string{{"mimetype": "text/plain", "body": "Poll closed"}},
 	})
 	return err
 }
@@ -523,4 +590,37 @@ func (b *Bridge) SendFile(ctx context.Context, roomID id.RoomID, ghostKey, filen
 func (b *Bridge) RoomConfig(key string) (config.Room, bool) {
 	room, ok := b.conf().Rooms[key]
 	return room, ok
+}
+
+// CommandFormatKey marks an edit the bridge made to one of the account
+// owner's own messages. Inbound events carrying it are dropped: the edit is
+// cosmetic, and treating it as a new message would run the command twice.
+const CommandFormatKey = "dev.aperte.command_format"
+
+// EditMine rewrites one of MY OWN messages, as me.
+//
+// The bridge cannot edit somebody else's event — an m.replace from a different
+// sender is not an edit — but it holds the account token, so it can send the
+// edit as the account owner. That is the only way to change how a message I
+// typed is rendered, which is what makes a command look like a command.
+func (b *Bridge) EditMine(ctx context.Context, roomID id.RoomID, target id.EventID, body, formatted string) error {
+	newContent := &event.MessageEventContent{
+		MsgType:       event.MsgText,
+		Body:          body,
+		Format:        event.FormatHTML,
+		FormattedBody: formatted,
+	}
+	content := &event.MessageEventContent{
+		MsgType:       event.MsgText,
+		Body:          "* " + body,
+		Format:        event.FormatHTML,
+		FormattedBody: "* " + formatted,
+		NewContent:    newContent,
+		RelatesTo:     &event.RelatesTo{Type: event.RelReplace, EventID: target},
+	}
+	_, err := b.user.SendMessageEvent(ctx, roomID, event.EventMessage, &event.Content{
+		Parsed: content,
+		Raw:    map[string]any{CommandFormatKey: true},
+	})
+	return err
 }

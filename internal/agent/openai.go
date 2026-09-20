@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -82,11 +83,11 @@ func (o *openAI) Send(ctx context.Context, conv Conversation, turn Turn, sink Si
 	if model == "" {
 		model = o.cfg.Model
 	}
-	if sink.Status != nil {
-		sink.Status("thinking")
-	}
+	// Not "thinking": until a delta arrives this is the queue and the prompt,
+	// and a model with reasoning off never thinks at all.
+	sink.Report("queued")
 
-	stream := sink.Delta != nil && !o.cfg.NoStream
+	stream := sink.Streams() && !o.cfg.NoStream
 	payload := make([]any, 0, len(messages))
 	for i, m := range messages {
 		if i == len(messages)-1 {
@@ -133,11 +134,15 @@ func (o *openAI) Send(ctx context.Context, conv Conversation, turn Turn, sink Si
 		return nil, err
 	}
 
-	if err := o.store.AppendTranscript(ctx, conv.ID, "user", turn.Text); err != nil {
-		return nil, err
-	}
-	if err := o.store.AppendTranscript(ctx, conv.ID, "assistant", answer); err != nil {
-		return nil, err
+	// No conversation id means no conversation: Ask uses that to get an answer
+	// that leaves nothing behind.
+	if conv.ID != "" {
+		if err := o.store.AppendTranscript(ctx, conv.ID, "user", turn.Text); err != nil {
+			return nil, err
+		}
+		if err := o.store.AppendTranscript(ctx, conv.ID, "assistant", answer); err != nil {
+			return nil, err
+		}
 	}
 	return &Reply{Text: answer}, nil
 }
@@ -167,6 +172,7 @@ func (o *openAI) readOneShot(body io.Reader) (string, error) {
 // delta to the sink and returning the whole answer at the end.
 func (o *openAI) readStream(body io.Reader, sink Sink) (string, error) {
 	var answer strings.Builder
+	var phase phaseTracker
 	err := readSSE(body, func(data []byte) error {
 		chunk, err := parseOpenAIChunk(data)
 		if err != nil {
@@ -177,8 +183,9 @@ func (o *openAI) readStream(body io.Reader, sink Sink) (string, error) {
 		}
 		for _, choice := range chunk.Choices {
 			if choice.Delta.Content != "" {
+				phase.to(sink, "writing")
 				answer.WriteString(choice.Delta.Content)
-				sink.Delta(choice.Delta.Content)
+				sink.Push(choice.Delta.Content)
 			}
 		}
 		return nil
@@ -195,6 +202,87 @@ func (o *openAI) Cancel(context.Context, string) error { return nil }
 
 // Transcribe uses the same endpoint family's /audio/transcriptions, which
 // llama.cpp's server and most OpenAI-compatible stacks provide.
+// Ask answers one question with no transcript around it. The bridge keeps the
+// history for this adapter, so "outside the conversation" is simply a request
+// that does not include it.
+func (o *openAI) Ask(ctx context.Context, model, question string) (string, error) {
+	if model == "" {
+		model = o.cfg.Model
+	}
+	// Send with no conversation: this adapter's history comes from the bridge,
+	// so a turn handed an empty transcript is a question on its own.
+	reply, err := o.Send(ctx, Conversation{Model: model}, Turn{Text: question, Internal: true}, Sink{})
+	if err != nil {
+		return "", err
+	}
+	return reply.Text, nil
+}
+
+// Share: a bare OpenAI endpoint has no conversation to publish.
+// Undo drops the last exchange from the transcript the bridge keeps for this
+// backend — for an adapter with no server-side history, that IS the history.
+func (o *openAI) Answer(ctx context.Context, conv Conversation, ask *Ask, answers map[string]string, sink Sink) (*Reply, error) {
+	return nil, ErrUnsupported
+}
+
+func (o *openAI) Undo(ctx context.Context, convID, _ string) error {
+	if o.store == nil {
+		return ErrUnsupported
+	}
+	return o.store.TrimTranscript(ctx, convID, 2)
+}
+
+func (o *openAI) Share(ctx context.Context, convID string) (string, error) {
+	return "", ErrUnsupported
+}
+
+// Compact: the bridge keeps this adapter's history, so compaction is its own
+// job — closing the conversation and seeding the next one with a summary.
+func (o *openAI) Compact(ctx context.Context, convID string) (string, error) {
+	return "", ErrUnsupported
+}
+
+// ContextUsage: nothing here counts tokens.
+func (o *openAI) ContextUsage(ctx context.Context, convID string) (string, error) {
+	return "", ErrUnsupported
+}
+
+// Models asks the endpoint what it serves. Anything OpenAI-shaped answers
+// /v1/models; one that does not simply has no list to offer.
+func (o *openAI) Models(ctx context.Context) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(o.cfg.URL, "/")+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	if key := o.cfg.Key(); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := o.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("model list: %s", resp.Status)
+	}
+	var out struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(out.Data))
+	for _, m := range out.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
 func (o *openAI) Transcribe(ctx context.Context, att Attachment) (string, error) {
 	return postTranscription(ctx, o.client, strings.TrimSuffix(o.cfg.URL, "/")+"/audio/transcriptions", o.cfg.Key(), o.cfg.Headers, att, o.cfg.Model)
 }

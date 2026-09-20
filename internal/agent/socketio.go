@@ -164,10 +164,42 @@ type owuiEvent struct {
 
 // owuiDelta is what interests us inside a response:completion or
 // chat:completion event.
+// owuiOutputItem is one entry of a message's output array.
+type owuiOutputItem struct {
+	Type      string `json:"type"`
+	ID        string `json:"id"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	Arguments string `json:"arguments"`
+}
+
 type owuiDelta struct {
 	Type    string          `json:"type"`  // response.output_text.delta, response.reasoning_text.delta, …
 	Delta   string          `json:"delta"` // for *.delta
 	Done    bool            `json:"done"`  // chat:completion terminal event
 	Content json.RawMessage `json:"content"`
 	Error   json.RawMessage `json:"error"`
+	// Item carries the tool call on response.output_item.added/done. Measured
+	// against 0.11.3 on 2026-09-20: item.type is "function_call" and item.name
+	// is the tool, e.g. "mcphub_time-get_current_time".
+	Item struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	} `json:"item"`
+	// Output is the whole message so far, on chat:completion. It is the only
+	// place a STAGED tool call shows up — ask_user ends the turn without
+	// done:true, so this is what says the turn is over (see askuser.go).
+	Output []owuiOutputItem `json:"output"`
+	// Usage rides on the terminal chat:completion event, straight from
+	// llama.cpp: prompt_per_second is prefill, predicted_per_second decode.
+	Usage *struct {
+		PromptTokens        int     `json:"prompt_tokens"`
+		CompletionTokens    int     `json:"completion_tokens"`
+		PromptPerSecond     float64 `json:"prompt_per_second"`
+		PredictedPerSecond  float64 `json:"predicted_per_second"`
+		PromptTokensDetails struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+	} `json:"usage"`
 }

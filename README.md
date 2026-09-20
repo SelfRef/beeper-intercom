@@ -143,19 +143,54 @@ Publishers move to `/v1/notify` only when they want threads, actions or media
 ## Talking to an agent
 
 A room with an `agent:` is conversational. Type in it and the agent answers:
-typing indicator while it thinks, a ⚙️ reaction on your message while it runs,
-**the answer streamed live into the bubble** as it is generated, Markdown
-rendered into the Matrix HTML subset, long answers split at paragraph
-boundaries and also attached as a `.md` file. A failure marks **your** message
-as failed (`com.beeper.message_send_status`) instead of adding an apology to
-the conversation.
+typing indicator while it works, a reaction on your message saying which phase
+it is in, Markdown rendered into the Matrix HTML subset, long answers split at
+paragraph boundaries and also attached as a `.md` file. A failure marks **your**
+message as failed (`com.beeper.message_send_status`) instead of adding an
+apology to the conversation.
 
-Streaming uses Beeper's `com.beeper.stream`: the first token opens a message
-carrying a stream descriptor, later tokens go to your devices as to-device
-updates, and the finished answer is committed as an edit — the copy every
-other device and every reload sees. Clients without stream support show `…`
-until that edit lands. Set `no_stream: true` on an agent to get one message
-per answer instead.
+**Progress** (`progress:` in the config) decides what a long turn looks like.
+
+| `mode` | What you see |
+| --- | --- |
+| `off` (default) | nothing until the answer is finished; the ghost types the whole time |
+| `edits` | the first chunk is posted and rewritten with the answer so far every `interval`, each partial marked with `suffix` (`…`) |
+| `stream` | Beeper's `com.beeper.stream`: the first chunk opens a message carrying a stream descriptor and later chunks go to subscribed devices as to-device updates |
+
+`stream` is the protocol-correct rendering and costs one to-device event per
+chunk instead of one room event, but **no client painted it when this was last
+measured** (2026-09-20: every delta shape was delivered to subscribed devices
+and dropped before the UI). `edits` is what works today. Either way the
+finished answer is committed as an edit of that first message — the copy every
+other device and every reload sees. `no_stream: true` on an agent turns the
+backend's own streaming off, which forces `off` behaviour for that agent.
+
+The reaction tracks the phase: ⏳ accepted (queued, and the prompt being
+processed), 🧠 reasoning, 🛠️ a tool call, 🌐 a tool call that goes out to the
+network, ✍️ writing the answer, ❓ waiting for an answer from you, 🗜️
+compacting. 🧠 means reasoning specifically — a model with thinking off never
+shows it, and the wait before the first token stays ⏳. Every emoji is configurable and `""` leaves a
+phase unmarked. How many of them you see depends on the backend — Open WebUI
+reports all five, a plain OpenAI endpoint only the first and last.
+
+**Questions from the model.** Open WebUI's `ask_user` tool does not run and
+return — it stops the turn with its questions staged on the message, expecting
+a UI to draw a card. The bridge asks each one as a **poll** instead and
+resolves the call with the answers, which resumes the same turn where it
+stopped. An answered poll is ended so the answer cannot be changed to one the
+model never saw; `questions.delete_after_answer: true` removes it from the room
+instead. A question that goes unanswered past `questions.timeout` (10 m by
+default) is reported as unanswered and the model carries on without it.
+
+A Matrix poll takes one of its options and nothing else, so when the model says
+a free-form answer is acceptable (`allow_other`), **a message typed into the
+room while the question is open is taken as the answer** instead of starting a
+new turn — and the question says `(or type answer)`, because nobody would guess
+it otherwise. When the model wants one of its fixed options and you type
+something else anyway, the question is **dropped**: the backend is told the
+call was cancelled, whatever it says about that is discarded, and your message
+becomes the next turn. A question nobody answers within `questions.timeout`
+says so in the room and the model carries on without it.
 
 **Attachments.** Send a photo and a vision model sees it; send a document and
 it goes through the backend's file path (Open WebUI uploads it and runs it
@@ -165,14 +200,141 @@ misheard word explains a strange answer, and the text becomes the turn. A
 caption becomes the question; without one the bridge asks the obvious
 ("What is in this image?").
 
-Commands, handled before anything reaches the backend:
+**Tools.** `tool_ids` are the tools an agent always has. `toolsets` are groups
+that can be switched on and off in the room with `/tools`, and their state
+belongs to the **conversation**: it starts at the configured default, `/tools`
+changes it, and the next conversation starts from the default again — so an
+escalation cannot outlive what it was granted for. A toolset with `idle:` also
+switches itself off after that long without a turn and says so in the room.
+
+```yaml
+toolsets:
+  rw:
+    description: Write access to my files, photos and repos
+    tools: [server:mcp:mcphub-me-rw]
+    default: false
+    idle: 15m
+```
+
+`features:` names Open WebUI's own capabilities (`web_search`,
+`code_interpreter`, `image_generation`, `memory`). They are not tools the
+bridge can pass: Open WebUI injects them itself, and only for a request that
+carries a session id, because anything else is "an API caller that does not
+expect hidden tools" (`utils/middleware.py`). Naming a feature therefore also
+puts the turn on Open WebUI's background-task path, which the adapter handles.
+
+**Reasoning effort** (`reasoning:` in the config) is `/think`. Most
+self-hosted catalogues publish one model id per effort rather than a parameter,
+by convention a suffix on a shared base — `qwen38`, `qwen38:t`, `qwen38:m` — so
+the bridge is told the convention and `/think medium` becomes `/model` with the
+base held fixed. The bare id, with no suffix, is always `off`.
+
+```yaml
+reasoning:
+  enabled: true
+  levels:
+    - { name: Think, ids: [think, t], suffix: ":t", description: thinking on }
+    - { name: Low, ids: [low, l], suffix: ":l" }
+    - { name: Medium, ids: [medium, m], suffix: ":m" }
+    - { name: High, ids: [high, h], suffix: ":h" }
+    - { name: Extra High, ids: [extra, x], suffix: ":x" }
+```
+
+`name` is what the level is called, `ids` are the words you may type for it —
+`/think extra` and `/think x` are the same thing — and the first id is the one
+hints and errors suggest.
+
+Which levels exist is not assumed: the backend's model list decides, so
+`/think` offers the variants that are actually served and says so when a model
+has none. Unlike `/model`, the change belongs to the **conversation** — a
+question that needs more thought is a question, not a new setting — and the
+next one is back to the room's model. Asked before a conversation exists
+(`/new`, then `/think high`), it waits for the one the next message opens.
+
+**The bridge's own voice.** A conversational room has one ghost and two
+speakers in it: the agent answering, and the bridge reporting on itself
+("Nothing to undo yet.", "`rw` switched off after 15 min idle"). Beeper renders
+`m.notice` from a ghost exactly like an ordinary message, so by default these
+are sent by the **bridge bot** instead, whose notices render as dim centred
+text with no bubble — in any room, not only a bridge-bot room. That rendering
+centres the whole message, so bridge messages are laid out as **tables**, never
+as bullet lists (a list's markers stay at the left margin while its text
+centres), and they use `data-mx-color` to mark state. A notice caused by a
+command is sent as a reply to it; autonomous ones, like a toolset going idle,
+are not replies to anything.
+
+```yaml
+notices:
+  sender: bot        # or ghost, which then uses the per-message profile below
+  name: System
+  id: system
+  reply: true
+```
+
+With `sender: ghost` the notice comes from the room's ghost carrying a
+`com.beeper.per_message_profile` — its own name and avatar for that one
+message, without a second room member, which would turn a dm into a group.
+
+**Deleting.** A redaction normally leaves a *"This message has been deleted"*
+tombstone, which for the bridge bot renders as a left-aligned bubble with a raw
+MXID — louder than the dim notice it replaced. The bridge declares
+`com.beeper.room_features` on every room with `delete_hide_placeholder`, so its
+own cleanup (`/undo`, a command taking back its output) leaves nothing behind.
+Set `delete_placeholder: true` on a room to get the tombstones back, which is
+worth doing where somebody acts on what is posted and a silent disappearance
+would be worse than a marker.
+
+That is what makes clearing up cheap. `/clean` removes the last bridge message
+and `/clean all` every one in the current conversation; **reacting to one of
+your own command messages** removes that message together with everything the
+bridge answered — a bridge message cannot be reacted to, so the command is the
+only handle there is. Any reaction does it by default:
+
+```yaml
+notices:
+  clean_on_reaction: true
+  clean_emoji: []        # empty = any; list a few to keep the rest free
+  format_commands: true  # rewrite your `/command` as inline code
+```
+
+**Editing a command** you already sent: if it is the newest one and the
+conversation is still the same, the edit is a correction — whatever it produced
+is swept out of the room and the new text runs in its place. Anything older is
+refused and the message is edited back to what it said, because its answer has
+already been read and there is no way to un-read it. Matrix cannot forbid an
+edit, so this is the bridge deciding what an edit means and putting the room
+back to match.
+
+`format_commands` edits the message **you** typed so a command renders as
+code. A bridge cannot edit somebody else's event — an `m.replace` from another
+sender is not an edit — but the message is yours and the bridge holds your
+account token, so it sends the edit as you. The client marks it "Edited",
+which is the price.
+
+Commands, handled before anything reaches the backend. A message that starts
+with `/` is always a command — an unknown one is an error, never a question
+for the model — and `//text` sends a message that really does start with a
+slash:
 
 | Command | Effect |
 | --- | --- |
-| `/new [title]` | start a new conversation |
-| `/agent <name>` | switch the backend for this room |
-| `/model <id>` | switch the model for this room |
-| `/status` | room, agent, model, session, transport |
+| `/` | status, and a pointer to `/help` |
+| `/new [toolset …]` | start a new conversation, with those toolsets already on |
+| `/tools [+name\|-name\|off]` | list this conversation's toolsets, switch them, or disarm all of them |
+| `/btw <question>` | answer something outside the conversation; nothing is stored and the thread is untouched |
+| `/undo` | take back the last exchange — deletes it from the backend's conversation too, and removes both messages from the room (every event the answer occupies: the anchor, its progressive edits, extra parts, the attached file) |
+| `/summary` | recap the conversation so far, as a notice |
+| `/compact` | summarise the conversation in place, keeping its id and recent turns (Open WebUI's own compaction); backends without one fall back to closing it and seeding the next |
+| `/history` | the room's recent conversations, with links |
+| `/share` | publish the conversation as a link anyone can open (Open WebUI share + an `anyone` read grant); set `public_url` on the agent or the link points at the compose hostname |
+| `/model [id\|reset]` | list the backend's models, or switch |
+| `/think [level\|off]` | list the reasoning levels this model has, or switch for this conversation |
+| `/agent [name\|reset]` | list the configured agents, or switch |
+| `/stop`, `/cancel` | cancel the answer being generated |
+| `/retry` | ask the last question again |
+| `/link` | open this conversation in the backend's web UI |
+| `/status` | room, agent, model and reasoning level, last turn's tokens and speed, tools, transport |
+| `/clean [all]` | remove the last bridge message, or every one in this conversation |
 | `/help` | the list |
 
 A new conversation starts when you ask for one, when the current one has been

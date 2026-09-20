@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -19,10 +20,84 @@ import (
 
 const (
 	kvAgentOverride = "agent_override:"
-	kvModelOverride = "model_override:"
-	typingRefresh   = 20 * time.Second
-	workingReaction = "⚙️"
+	// kvCompactRequest marks a conversation that was closed by /compact, so
+	// the next one is seeded with its summary even when the agent does not
+	// carry summaries on an ordinary rotation.
+	kvCompactRequest = "compact:"
+	kvModelOverride  = "model_override:"
+	typingRefresh    = 20 * time.Second
 )
+
+// progressMarker is the reaction on the question, tracking which phase the
+// turn is in. Matrix has no editable reaction, so a phase change is a new
+// reaction and a redaction of the old one; phases that map to the same emoji
+// (or to none) cost nothing, and a backend that reports nothing leaves the
+// first one in place for the whole turn.
+type progressMarker struct {
+	s        *Service
+	roomID   id.RoomID
+	ghostKey string
+	target   id.EventID
+
+	mu      sync.Mutex
+	phase   string
+	emoji   string
+	eventID id.EventID
+}
+
+func (s *Service) newProgress(roomID id.RoomID, ghostKey string, target id.EventID) *progressMarker {
+	return &progressMarker{s: s, roomID: roomID, ghostKey: ghostKey, target: target}
+}
+
+// set moves the marker to a phase. Unknown phases and phases the operator left
+// empty are ignored, so the previous one stays rather than the marker
+// flickering off.
+func (m *progressMarker) set(ctx context.Context, phase string) {
+	if m == nil {
+		return
+	}
+	emoji := m.s.conf().Progress.Reactions.Emoji(phase)
+	if emoji == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if phase == m.phase || emoji == m.emoji {
+		m.phase = phase
+		return
+	}
+	old := m.eventID
+	// New first, old second: a moment with two reactions reads better than a
+	// moment with none.
+	added, err := m.s.bridge.React(ctx, m.roomID, m.ghostKey, m.target, emoji)
+	if err != nil {
+		m.s.log.Debug().Err(err).Str("phase", phase).Msg("Could not set the progress marker")
+		return
+	}
+	m.phase, m.emoji, m.eventID = phase, emoji, added
+	if old != "" {
+		if err := m.s.bridge.Redact(ctx, m.roomID, m.ghostKey, old); err != nil {
+			m.s.log.Debug().Err(err).Msg("Could not clear the previous progress marker")
+		}
+	}
+}
+
+// clear removes the marker: the answer is there, the phase no longer matters.
+func (m *progressMarker) clear(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	old := m.eventID
+	m.eventID, m.emoji, m.phase = "", "", ""
+	m.mu.Unlock()
+	if old == "" {
+		return
+	}
+	if err := m.s.bridge.Redact(ctx, m.roomID, m.ghostKey, old); err != nil {
+		m.s.log.Debug().Err(err).Msg("Could not clear the progress marker")
+	}
+}
 
 // onMessage is the entry point for everything the account owner types.
 func (s *Service) onMessage(ctx context.Context, msg *bridge.Message) {
@@ -30,13 +105,25 @@ func (s *Service) onMessage(ctx context.Context, msg *bridge.Message) {
 	if !ok {
 		return
 	}
-	if strings.HasPrefix(strings.TrimSpace(msg.Body), "/") {
+	body := strings.TrimSpace(msg.Body)
+	switch {
+	case strings.HasPrefix(body, "//"):
+		// The escape hatch: everything else starting with a slash is a
+		// command, so a message that really begins with one needs a way in.
+		msg.Body = strings.TrimPrefix(body, "/")
+	case strings.HasPrefix(body, "/"):
 		// Commands are answered even in a room with no agent, because /status
 		// is how you find out why a room has no agent.
 		go s.handleCommand(detach(ctx), msg, room)
 		return
 	}
 	if room.Agent == "" {
+		return
+	}
+	// A question of the model's may be open, and a poll cannot take a typed
+	// answer. One that accepts free text takes this message as the answer; one
+	// that does not is dropped, and the message carries on as a new turn.
+	if s.offerMessage(ctx, sessionKey(msg.RoomKey, msg.ThreadRoot), strings.TrimSpace(msg.Body)) == messageIsTheAnswer {
 		return
 	}
 	go s.handleTurn(detach(ctx), msg, room)
@@ -95,33 +182,36 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 	stopTyping := s.keepTyping(turnCtx, roomID, ghostKey)
 	defer stopTyping()
 
-	// A reaction on my own message is cheaper than a "working on it" bubble
-	// and disappears when the answer lands.
-	marker, err := s.bridge.React(ctx, roomID, ghostKey, msg.EventID, workingReaction)
-	if err != nil {
-		s.log.Debug().Err(err).Msg("Could not set the working marker")
-	}
-	defer func() {
-		if marker != "" {
-			if err := s.bridge.Redact(ctx, roomID, ghostKey, marker); err != nil {
-				s.log.Debug().Err(err).Msg("Could not clear the working marker")
-			}
-		}
-	}()
+	// A reaction on the question is cheaper than a "working on it" bubble and
+	// disappears when the answer lands. It also says which phase the turn is
+	// in, so a long wait is legible: queued, thinking, searching, writing.
+	marker := s.newProgress(roomID, ghostKey, msg.EventID)
+	marker.set(ctx, "queued")
+	defer marker.clear(ctx)
 
-	// Streaming: the first delta opens a live bubble (com.beeper.stream) and
-	// every later one feeds it; the finished answer is committed as an edit.
-	// If the anchor cannot be sent, deltas are dropped and the answer arrives
-	// the old way — streaming is comfort, not correctness.
+	// Progress: with progress.mode off nothing is shown until the answer is
+	// finished — the ghost simply types. Otherwise the first chunk opens the
+	// answer bubble and every later one grows it, either as edits of that
+	// bubble or as com.beeper.stream deltas (see internal/bridge/stream.go for
+	// why edits are the default of the two). If the bubble cannot be opened,
+	// the chunks are dropped and the answer arrives the old way — progress is
+	// comfort, not correctness.
 	answerOpts := bridge.SendOptions{ThreadRoot: msg.ThreadRoot}
 	if answerOpts.ThreadRoot != "" {
 		answerOpts.ReplyTo = msg.EventID
 	}
+	progress := s.conf().Progress
+	streamOpts := bridge.StreamOptions{
+		Edits:    progress.Mode == config.ProgressEdits,
+		Deltas:   progress.Mode == config.ProgressStream,
+		Interval: progress.Interval.Or(1500 * time.Millisecond),
+		Suffix:   progress.Suffix,
+	}
 	var stream *bridge.Stream
 	var streamMu sync.Mutex
 	streamFailed := false
-	sink := agent.Sink{}
-	if backend.Caps().Streaming {
+	sink := agent.Sink{Status: func(state string) { marker.set(ctx, state) }}
+	if backend.Caps().Streaming && progress.Mode != config.ProgressOff {
 		sink.Delta = func(text string) {
 			streamMu.Lock()
 			defer streamMu.Unlock()
@@ -129,7 +219,9 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 				if streamFailed {
 					return
 				}
-				opened, err := s.bridge.StartStream(ctx, roomID, ghostKey, answerOpts)
+				// The first chunk becomes the anchor's body, so the bubble
+				// starts with words instead of a placeholder.
+				opened, err := s.bridge.StartStream(ctx, roomID, ghostKey, answerOpts, text, streamOpts)
 				if err != nil {
 					streamFailed = true
 					s.log.Warn().Err(err).Msg("Could not open a stream; falling back to one message")
@@ -137,6 +229,7 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 				}
 				stream = opened
 				stopTyping()
+				return
 			}
 			stream.Push(text)
 		}
@@ -146,6 +239,21 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 	if err != nil {
 		s.reportFailure(ctx, msg, err)
 		return
+	}
+
+	// Toolsets: whatever this conversation has switched on, on top of the
+	// agent's fixed tools. A toolset that timed out while nobody was looking
+	// is reported here rather than silently missing from the answer.
+	if agentCfg, ok := s.conf().Agents[sess.Agent]; ok {
+		sessionID := fmt.Sprint(sess.ID)
+		s.adoptToolsets(ctx, agentCfg, msg.RoomKey, msg.ThreadRoot, sessionID)
+		tools, expired := s.activeTools(ctx, agentCfg, msg.RoomKey, msg.ThreadRoot, sessionID)
+		turn.Tools = tools
+		for _, name := range expired {
+			s.notice(ctx, roomID, ghostKey, msg.ThreadRoot,
+				fmt.Sprintf("`%s` had switched off on idle; this answer runs without it.", name))
+		}
+		s.touchToolsets(ctx, agentCfg, room, msg.RoomKey, roomID, msg.ThreadRoot, sessionID)
 	}
 
 	conv := agent.Conversation{ID: sess.ConvID, Parent: parent, Model: sess.Model, Turns: sess.Turns}
@@ -165,9 +273,30 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 		s.reportFailure(ctx, msg, err)
 		return
 	}
+	// A turn can stop to ask ME something instead of answering. The questions
+	// go out as polls and the answers resume the same turn, so what lands
+	// below is the answer to the question I actually meant.
+	if reply.Ask != nil {
+		// Not typing: the model is waiting for me, not the other way round.
+		stopTyping()
+		if opened != nil {
+			// Whatever was streamed so far is posted by resolveAsks as its own
+			// message; the anchor would otherwise sit half-written forever.
+			opened.Abort(ctx)
+			streamMu.Lock()
+			stream, opened = nil, nil
+			streamMu.Unlock()
+		}
+		reply = s.resolveAsks(turnCtx, msg, room, ghostKey, backend, conv, reply, marker, sess.ID)
+		if reply == nil || (reply.Ask != nil && strings.TrimSpace(reply.Text) == "") {
+			return
+		}
+		stopTyping = s.keepTyping(ctx, roomID, ghostKey)
+	}
+
 	stopTyping()
 
-	replyEvent, err := s.postAnswer(ctx, msg, ghostKey, reply.Text, opened, answerOpts)
+	replyEvent, answerEvents, err := s.postAnswer(ctx, msg, ghostKey, reply.Text, opened, answerOpts)
 	if err != nil {
 		s.reportFailure(ctx, msg, err)
 		return
@@ -179,11 +308,21 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 	if err := s.store.AdvanceSession(ctx, sess.ID, parent); err != nil {
 		s.log.Error().Err(err).Msg("Failed to advance session")
 	}
+	usage := ""
+	if reply.Usage != nil {
+		if raw, err := json.Marshal(reply.Usage); err == nil {
+			usage = string(raw)
+		}
+	}
 	if err := s.store.PutTurn(ctx, &store.Turn{
-		EventID:    msg.EventID.String(),
-		SessionID:  sess.ID,
-		ParentID:   conv.Parent,
-		ReplyEvent: replyEvent.String(),
+		EventID:      msg.EventID.String(),
+		SessionID:    sess.ID,
+		UserMsgID:    reply.UserMessage,
+		ParentID:     conv.Parent,
+		ReplyEvent:   replyEvent.String(),
+		AnswerEvents: eventStrings(answerEvents),
+		Question:     msg.Body,
+		Usage:        usage,
 	}); err != nil {
 		s.log.Error().Err(err).Msg("Failed to record turn")
 	}
@@ -247,7 +386,7 @@ func (s *Service) buildTurn(ctx context.Context, msg *bridge.Message, room confi
 // boundaries and attaching anything that is too long to read in a bubble.
 // With a live stream, the first part becomes the stream's final edit — the
 // durable copy of what was streamed — and only the overflow is new messages.
-func (s *Service) postAnswer(ctx context.Context, msg *bridge.Message, ghostKey, text string, stream *bridge.Stream, opts bridge.SendOptions) (id.EventID, error) {
+func (s *Service) postAnswer(ctx context.Context, msg *bridge.Message, ghostKey, text string, stream *bridge.Stream, opts bridge.SendOptions) (id.EventID, []id.EventID, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		text = "_(the agent returned an empty answer)_"
@@ -256,20 +395,26 @@ func (s *Service) postAnswer(ctx context.Context, msg *bridge.Message, ghostKey,
 	limit := s.conf().Limits.MessageSplitBytes
 	parts := bridge.SplitMessage(text, limit)
 
+	// Every event the answer occupies, so /undo can take all of it back — an
+	// answer is not always one event: it can be an anchor plus the edits that
+	// grew it, several parts, and a file.
 	var first id.EventID
+	var events []id.EventID
 	for i, part := range parts {
 		plain, formatted := bridge.Markdown(part)
 		if i == 0 && stream != nil {
 			if err := stream.Finish(ctx, plain, formatted); err != nil {
-				return "", err
+				return "", stream.Events(), err
 			}
 			first = stream.EventID
+			events = append(events, stream.Events()...)
 			continue
 		}
 		sent, err := s.bridge.SendText(ctx, msg.RoomID, ghostKey, plain, formatted, opts)
 		if err != nil {
-			return first, err
+			return first, events, err
 		}
+		events = append(events, sent)
 		if first == "" {
 			first = sent
 		}
@@ -281,11 +426,13 @@ func (s *Service) postAnswer(ctx context.Context, msg *bridge.Message, ghostKey,
 		uri, err := s.bridge.UploadBytes(ctx, ghostKey, "answer.md", "text/markdown", []byte(text))
 		if err != nil {
 			s.log.Warn().Err(err).Msg("Failed to upload the long answer")
-		} else if _, err := s.bridge.SendFile(ctx, msg.RoomID, ghostKey, "answer.md", "text/markdown", uri, len(text), opts); err != nil {
+		} else if sent, err := s.bridge.SendFile(ctx, msg.RoomID, ghostKey, "answer.md", "text/markdown", uri, len(text), opts); err != nil {
 			s.log.Warn().Err(err).Msg("Failed to attach the long answer")
+		} else {
+			events = append(events, sent)
 		}
 	}
-	return first, nil
+	return first, events, nil
 }
 
 // sessionFor returns the live session for this message, rotating it when the
@@ -306,10 +453,7 @@ func (s *Service) sessionFor(ctx context.Context, msg *bridge.Message, room conf
 		return nil, nil, fmt.Errorf("agent %q is configured but was not built", agentName)
 	}
 
-	model := agentCfg.Model
-	if override, _ := s.store.GetKV(ctx, kvModelOverride+msg.RoomKey); override != "" {
-		model = override
-	}
+	model := s.currentModel(ctx, msg, agentCfg)
 
 	threadRoot := msg.ThreadRoot.String()
 	live, err := s.store.LiveSession(ctx, msg.RoomKey, threadRoot)
@@ -338,7 +482,8 @@ func (s *Service) sessionFor(ctx context.Context, msg *bridge.Message, room conf
 		ThreadRoot: threadRoot,
 		Agent:      agentName,
 		ConvID:     convID,
-		Model:      model,
+		// /think before the conversation existed was meant for this one.
+		Model: s.applyPendingReasoning(ctx, msg.RoomKey, threadRoot, model),
 	})
 	if err != nil {
 		return nil, nil, err
@@ -394,7 +539,23 @@ func (s *Service) seedFor(ctx context.Context, msg *bridge.Message, previous *st
 			return &agent.Seed{Room: msg.RoomKey, Kind: "notification", Text: text}
 		}
 	}
-	if previous != nil && agentCfg.Session.CarrySummary {
+	// /compact closed the conversation on purpose and wants its summary
+	// carried over, whether or not this agent does that on an ordinary
+	// rotation. The marker is consumed here: one compaction, one seed.
+	compactKey := kvCompactRequest + msg.RoomKey + "\x00" + msg.ThreadRoot.String()
+	compact := false
+	if marked, err := s.store.GetKV(ctx, compactKey); err == nil && marked != "" {
+		compact = true
+		_ = s.store.SetKV(ctx, compactKey, "")
+		if previous == nil {
+			// The session was closed by the command, so it is no longer the
+			// live one — take the newest closed conversation of this slot.
+			if recent, err := s.store.RoomSessions(ctx, msg.RoomKey, msg.ThreadRoot.String(), 1); err == nil && len(recent) > 0 {
+				previous = recent[0]
+			}
+		}
+	}
+	if previous != nil && (compact || agentCfg.Session.CarrySummary) {
 		if summary := s.summarise(ctx, previous, agentCfg); summary != "" {
 			return &agent.Seed{Room: msg.RoomKey, Kind: "summary", Text: summary}
 		}
@@ -514,4 +675,18 @@ func (s *Service) onRedaction(ctx context.Context, roomKey string, roomID id.Roo
 		}
 	}
 	s.log.Info().Str("room", roomKey).Msg("Cancelled a turn after its message was deleted")
+}
+
+// eventStrings is the storable form of an event list.
+func eventStrings(events []id.EventID) []string {
+	out := make([]string, 0, len(events))
+	seen := make(map[id.EventID]bool, len(events))
+	for _, e := range events {
+		if e == "" || seen[e] {
+			continue
+		}
+		seen[e] = true
+		out = append(out, e.String())
+	}
+	return out
 }
