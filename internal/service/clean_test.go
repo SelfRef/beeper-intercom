@@ -12,7 +12,7 @@ import (
 )
 
 // Which reactions sweep a command away. The default is "any", because the
-// point is to be faster than typing /clean.
+// point is to be faster than typing /clear.
 func TestCleanTriggeredBy(t *testing.T) {
 	off := false
 	for name, tc := range map[string]struct {

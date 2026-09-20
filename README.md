@@ -284,8 +284,9 @@ Set `delete_placeholder: true` on a room to get the tombstones back, which is
 worth doing where somebody acts on what is posted and a silent disappearance
 would be worse than a marker.
 
-That is what makes clearing up cheap. `/clean` removes the last bridge message
-and `/clean all` every one in the current conversation; **reacting to one of
+That is what makes clearing up cheap. `/clear` removes the last bridge message
+and `/clear all` every one in the current conversation (`/clean` is an alias for
+both); **reacting to one of
 your own command messages** removes that message together with everything the
 bridge answered — a bridge message cannot be reacted to, so the command is the
 only handle there is. Any reaction does it by default:
@@ -325,7 +326,8 @@ slash:
 | `/undo` | take back the last exchange — deletes it from the backend's conversation too, and removes both messages from the room (every event the answer occupies: the anchor, its progressive edits, extra parts, the attached file) |
 | `/summary` | recap the conversation so far, as a notice |
 | `/compact` | summarise the conversation in place, keeping its id and recent turns (Open WebUI's own compaction); backends without one fall back to closing it and seeding the next |
-| `/history` | the room's recent conversations, with links |
+| `/history` | the room's recent conversations, numbered from 0 (the most recent), with links |
+| `/resume [n]` · `/continue` | pick up where a finished conversation left off: the one before this by default, or the `/history` number |
 | `/share` | publish the conversation as a link anyone can open (Open WebUI share + an `anyone` read grant); set `public_url` on the agent or the link points at the compose hostname |
 | `/model [id\|reset]` | list the backend's models, or switch |
 | `/think [level\|off]` | list the reasoning levels this model has, or switch for this conversation |
@@ -334,7 +336,7 @@ slash:
 | `/retry` | ask the last question again |
 | `/link` | open this conversation in the backend's web UI |
 | `/status` | room, agent, model and reasoning level, last turn's tokens and speed, tools, transport |
-| `/clean [all]` | remove the last bridge message, or every one in this conversation |
+| `/clear [all]` · `/clean` | remove the last bridge message, or every one in this conversation |
 | `/help` | the list |
 
 A new conversation starts when you ask for one, when the current one has been
@@ -342,6 +344,17 @@ idle past `idle_minutes`, when it hits `max_turns`, or whenever you reply in a
 thread — a thread is a side conversation and gets its own. With
 `carry_summary: true` the outgoing conversation is asked to summarise itself
 and the new one starts from that summary.
+
+None of that throws anything away, which is what makes `/resume` cheap: the
+backend conversation is still there, so the bridge only has to make its row the
+live one again and the next message continues that chat from the same branch
+tip, with the model it was using. `/resume` takes the most recent one that is
+not the one you are in; `/resume 3` takes the fourth line of `/history`. A room
+and thread have exactly one live conversation, so whatever was current is
+closed as the old one comes back — resuming it again is another `/resume`.
+Resuming also counts as activity, so an old conversation is not immediately
+rotated away for being idle; one that already hit `max_turns` still is, and the
+reply says so.
 
 ### Agent adapters
 

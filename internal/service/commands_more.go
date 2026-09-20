@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -203,9 +204,15 @@ func (s *Service) commandCompact(ctx context.Context, msg *bridge.Message, room 
 	return "Compacting. The next message continues in a fresh conversation, seeded with a summary of this one."
 }
 
-// commandHistory lists the recent conversations of this room.
+// historyLimit is how many conversations /history shows — and therefore how
+// far /resume can reach back, since it addresses them by the number in that
+// list.
+const historyLimit = 10
+
+// commandHistory lists the recent conversations of this room. The number in
+// front of each one is what /resume takes: 0 is the most recent.
 func (s *Service) commandHistory(ctx context.Context, msg *bridge.Message, room config.Room) string {
-	sessions, err := s.store.RoomSessions(ctx, msg.RoomKey, msg.ThreadRoot.String(), 10)
+	sessions, err := s.store.RoomSessions(ctx, msg.RoomKey, msg.ThreadRoot.String(), historyLimit)
 	if err != nil {
 		return "Could not read the history: " + err.Error()
 	}
@@ -213,11 +220,12 @@ func (s *Service) commandHistory(ctx context.Context, msg *bridge.Message, room 
 		return "No conversations in this room yet."
 	}
 	rows := make([][]string, 0, len(sessions))
-	for _, sess := range sessions {
+	for i, sess := range sessions {
+		index := strconv.Itoa(i)
 		when := time.UnixMilli(sess.LastActive).Local().Format("Mon 15:04")
 		turns := fmt.Sprintf("%d turns", sess.Turns)
 		if sess.Live {
-			when, turns = yes(when), yes(turns)
+			index, when, turns = yes(index), yes(when), yes(turns)
 		}
 		link := ""
 		if backend, ok := s.agentFor(sess.Agent); ok {
@@ -225,10 +233,92 @@ func (s *Service) commandHistory(ctx context.Context, msg *bridge.Message, room 
 				link = "[open](" + url + ")"
 			}
 		}
-		rows = append(rows, []string{when, turns, code(sess.Model), link})
+		rows = append(rows, []string{index, when, turns, code(sess.Model), link})
 	}
-	return table([]string{"Recent conversations", "", "Model", ""}, rows) +
-		"\nThe current one is marked."
+	return table([]string{"#", "Recent conversations", "", "Model", ""}, rows) +
+		"\nThe current one is marked; `/resume <number>` picks up any of the others."
+}
+
+// commandResume puts a finished conversation back: the one before this by
+// default, or one of the numbers /history prints.
+//
+// Resuming is entirely local bookkeeping — the backend conversation was never
+// deleted, only let go of. Making its row live again means the next message
+// continues that chat, from the same branch tip, with the model it was using.
+func (s *Service) commandResume(ctx context.Context, msg *bridge.Message, room config.Room, args string) string {
+	sessions, err := s.store.RoomSessions(ctx, msg.RoomKey, msg.ThreadRoot.String(), historyLimit)
+	if err != nil {
+		return "Could not read the history: " + err.Error()
+	}
+	if len(sessions) == 0 {
+		return "No conversations in this room yet — the next message starts one."
+	}
+
+	var target *store.Session
+	if arg := strings.TrimSpace(args); arg == "" {
+		// Bare /resume means the conversation I was in before this one: the
+		// most recent that is not already live.
+		for _, sess := range sessions {
+			if !sess.Live {
+				target = sess
+				break
+			}
+		}
+		if target == nil {
+			return "Nothing to resume — this room has only the conversation you are in."
+		}
+	} else {
+		n, convErr := strconv.Atoi(arg)
+		if convErr != nil || n < 0 || n >= len(sessions) {
+			return fmt.Sprintf("`%s` is not one of the numbers in `/history` (0–%d).", arg, len(sessions)-1)
+		}
+		target = sessions[n]
+		if target.Live {
+			return "That is the conversation you are already in."
+		}
+	}
+
+	// RoomSessions is a listing; the row that is about to become live has to
+	// be the whole thing.
+	full, err := s.store.SessionByID(ctx, target.ID)
+	if err != nil || full == nil {
+		return "Could not read that conversation."
+	}
+	if _, ok := s.agentFor(full.Agent); !ok {
+		return "That conversation's agent (" + code(full.Agent) + ") is no longer configured."
+	}
+	// A room and thread have one live conversation, so the current one goes
+	// away before this one comes back.
+	live, err := s.store.LiveSession(ctx, msg.RoomKey, msg.ThreadRoot.String())
+	if err != nil {
+		return "Could not read the current conversation: " + err.Error()
+	}
+	if live != nil && live.ID != full.ID {
+		if err := s.store.CloseSession(ctx, live.ID); err != nil {
+			return "Could not put the current conversation away: " + err.Error()
+		}
+	}
+	if err := s.store.ReopenSession(ctx, full.ID); err != nil {
+		return "Could not resume: " + err.Error()
+	}
+
+	when := time.UnixMilli(full.LastActive).Local().Format("Mon 15:04")
+	reply := fmt.Sprintf("Resumed the conversation from **%s** — %d turns, %s.",
+		when, full.Turns, code(full.Model))
+	if backend, ok := s.agentFor(full.Agent); ok {
+		if url := backend.Link(full.ConvID); url != "" {
+			reply += " [open](" + url + ")"
+		}
+	}
+	// Idle is reset by resuming, but a conversation that hit the turn ceiling
+	// is still over it, and the next message would rotate it without warning.
+	if agentCfg, ok := s.conf().Agents[full.Agent]; ok {
+		if max := agentCfg.Session.MaxTurns; max > 0 && full.Turns >= max {
+			reply += fmt.Sprintf("\n%s It is at the %d-turn limit, so the next message starts a fresh conversation seeded from this one.",
+				colour(colourWarn, "Note:"), max)
+		}
+	}
+	return reply
 }
 
 // commandShare publishes the conversation and returns a link that does not ask

@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS polls (
 );
 
 -- The bridge's own messages: command replies and the notices it posts about
--- itself. Tracked only so they can be taken back again — /clean, and reacting
+-- itself. Tracked only so they can be taken back again — /clear, and reacting
 -- to a command to sweep it away with its answer.
 CREATE TABLE IF NOT EXISTS notices (
 	event_id      TEXT PRIMARY KEY,
@@ -551,6 +551,16 @@ func (s *Store) SetSessionTitle(ctx context.Context, id int64, title string) err
 
 func (s *Store) CloseSession(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET closed_at = ? WHERE id = ? AND closed_at IS NULL`, now(), id)
+	return err
+}
+
+// ReopenSession makes a closed conversation the live one again — /resume.
+// The activity stamp moves with it, because a conversation picked up on
+// purpose is not idle, and the idle rule would otherwise rotate it away on the
+// very next message. The caller closes whatever was live first: a room and
+// thread have exactly one live conversation.
+func (s *Store) ReopenSession(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET closed_at = NULL, last_active = ? WHERE id = ?`, now(), id)
 	return err
 }
 
@@ -958,7 +968,7 @@ func (s *Store) Notices(ctx context.Context, roomKey, threadRoot string, limit i
 }
 
 // NoticesSince returns the bridge's messages posted at or after a timestamp —
-// what /clean all sweeps when a conversation is running.
+// what /clear all sweeps when a conversation is running.
 func (s *Store) NoticesSince(ctx context.Context, roomKey, threadRoot string, since int64) ([]*Notice, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+noticeCols+` FROM notices

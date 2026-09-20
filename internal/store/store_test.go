@@ -120,6 +120,50 @@ func TestSessionLifecycle(t *testing.T) {
 	}
 }
 
+// /resume: a closed conversation becomes the live one again, but only after
+// the one that holds the slot has let go of it.
+func TestReopenSession(t *testing.T) {
+	ctx := context.Background()
+	st := open(t)
+
+	first, err := st.CreateSession(ctx, &Session{RoomKey: "chat", Agent: "main", ConvID: "c1", Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AdvanceSession(ctx, first.ID, "assistant-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CloseSession(ctx, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := st.CreateSession(ctx, &Session{RoomKey: "chat", Agent: "main", ConvID: "c2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// While the newer one is live, the slot is taken.
+	if err := st.ReopenSession(ctx, first.ID); err == nil {
+		t.Error("expected reopening to collide with the live conversation")
+	}
+	if err := st.CloseSession(ctx, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReopenSession(ctx, first.ID); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	live, err := st.LiveSession(ctx, "chat", "")
+	if err != nil || live == nil {
+		t.Fatalf("live session: %v %v", live, err)
+	}
+	// Everything the next turn needs comes back with it, and the conversation
+	// is not idle any more.
+	if live.ID != first.ID || live.ConvID != "c1" || live.ParentID != "assistant-1" || live.Turns != 1 {
+		t.Errorf("resumed session = %+v", live)
+	}
+	if live.LastActive < first.LastActive {
+		t.Errorf("last_active went backwards: %d < %d", live.LastActive, first.LastActive)
+	}
+}
+
 func TestTranscriptWindow(t *testing.T) {
 	ctx := context.Background()
 	st := open(t)
@@ -343,7 +387,7 @@ func TestNoticeBookkeeping(t *testing.T) {
 	if left, err := st.Notices(ctx, "chat", "", 0); err != nil || len(left) != 1 {
 		t.Fatalf("after deleting two, %d left (%v)", len(left), err)
 	}
-	// Deleting nothing is not an error: /clean with nothing to clean.
+	// Deleting nothing is not an error: /clear with nothing to clean.
 	if err := st.DeleteNotices(ctx, nil); err != nil {
 		t.Fatal(err)
 	}

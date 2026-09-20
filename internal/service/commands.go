@@ -39,11 +39,12 @@ var helpText = "**Commands** — everything starting with `/` is handled here an
 		{"`/stop` · `/cancel`", "cancel the answer being generated"},
 		{"`/summary`", "recap the conversation so far"},
 		{"`/compact`", "summarise it in place and keep going"},
-		{"`/history`", "recent conversations in this room"},
+		{"`/history`", "recent conversations in this room, numbered"},
+		{"`/resume [n]` · `/continue`", "pick up the conversation before this one, or one by its `/history` number"},
 		{"`/share`", "publish it as a link anyone can open"},
 		{"`/link`", "open this conversation in the web UI"},
 		{"`/status`", "room, agent, model, context, tools, transport"},
-		{"`/clean [all]`", "remove the last bridge message, or every one in this conversation"},
+		{"`/clear [all]` · `/clean`", "remove the last bridge message, or every one in this conversation"},
 		{"`/help`", "this table"},
 	}) +
 	"\nReplying in a thread starts a side conversation; reacting to a notification runs its action."
@@ -73,7 +74,7 @@ func (s *Service) handleCommand(ctx context.Context, msg *bridge.Message, room c
 		}
 	}
 
-	// Remembered so that an edit of it can be judged later, and so /clean can
+	// Remembered so that an edit of it can be judged later, and so /clear can
 	// find what it caused.
 	sessionID := int64(0)
 	if live, err := s.store.LiveSession(ctx, msg.RoomKey, msg.ThreadRoot.String()); err == nil && live != nil {
@@ -118,6 +119,8 @@ func (s *Service) handleCommand(ctx context.Context, msg *bridge.Message, room c
 		reply = s.commandCompact(ctx, msg, room)
 	case "/history":
 		reply = s.commandHistory(ctx, msg, room)
+	case "/resume", "/continue":
+		reply = s.commandResume(ctx, msg, room, args)
 	case "/share":
 		reply = s.commandShare(ctx, msg)
 	case "/retry":
@@ -126,7 +129,7 @@ func (s *Service) handleCommand(ctx context.Context, msg *bridge.Message, room c
 		reply = s.commandLink(ctx, msg)
 	case "/status":
 		reply = s.commandStatus(ctx, msg, room)
-	case "/clean":
+	case "/clear", "/clean":
 		reply = s.commandClean(ctx, msg, room, args)
 	default:
 		reply = fmt.Sprintf("`%s` is not a command. `/help` for the list; `//%s` sends it as a message.",
@@ -174,7 +177,7 @@ func (s *Service) postNoticeReply(ctx context.Context, roomID id.RoomID, ghostKe
 		s.log.Warn().Err(err).Msg("Failed to post a notice")
 		return
 	}
-	// Remembered so it can be taken back: /clean, or a reaction on the command
+	// Remembered so it can be taken back: /clear, or a reaction on the command
 	// that caused it. A bridge message cannot be reacted to, so the command is
 	// the only handle the user has.
 	roomKey, known := s.bridge.RoomKey(roomID)

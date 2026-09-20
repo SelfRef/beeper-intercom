@@ -487,7 +487,7 @@ type Notices struct {
 	// CleanOnReaction makes any reaction to one of MY command messages remove
 	// that message and everything the bridge said in answer to it. It is the
 	// fastest way to tidy up, because a bridge message cannot be reacted to
-	// itself — only my own can. On by default; `/clean` does the same thing
+	// itself — only my own can. On by default; `/clear` does the same thing
 	// without a reaction.
 	CleanOnReaction *bool `yaml:"clean_on_reaction"`
 	// CleanEmoji limits which reactions do that. Empty means any of them.

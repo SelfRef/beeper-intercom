@@ -250,7 +250,7 @@ notices:
   # React to one of YOUR OWN command messages and it is removed together with
   # everything the bridge said in answer to it. A bridge message cannot be
   # reacted to, so the command is the only handle there is — and because the
-  # bridge hides the deletion tombstone, the pair simply disappears. `/clean`
+  # bridge hides the deletion tombstone, the pair simply disappears. `/clear`
   # does the same without a reaction.
   clean_on_reaction: true
   # Which reactions do that. Empty means any of them; list a few to keep the

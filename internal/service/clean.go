@@ -20,7 +20,8 @@ import (
 // ways to remove it, because a bridge message cannot be reacted to — only my
 // own messages can:
 //
-//   - /clean, which takes the last one (or all of them, in this conversation);
+//   - /clear (or its older name /clean), which takes the last one — or all of
+//     them, in this conversation;
 //   - a reaction on the command I typed, which takes that message and
 //     everything the bridge said in answer to it.
 //
@@ -66,7 +67,7 @@ func (s *Service) commandClean(ctx context.Context, msg *bridge.Message, room co
 	gone := make([]string, 0, len(commands))
 	for _, command := range commands {
 		if command == msg.EventID.String() {
-			continue // this /clean is redacted below, whatever else happens
+			continue // this /clear is redacted below, whatever else happens
 		}
 		s.redactMine(ctx, msg.RoomID, room, id.EventID(command), "a command")
 		gone = append(gone, command)
@@ -75,8 +76,8 @@ func (s *Service) commandClean(ctx context.Context, msg *bridge.Message, room co
 		s.log.Debug().Err(err).Msg("Removed commands but could not forget them")
 	}
 
-	// The /clean command itself is the last piece of clutter.
-	s.redactMine(ctx, msg.RoomID, room, msg.EventID, "the /clean command")
+	// The /clear command itself is the last piece of clutter.
+	s.redactMine(ctx, msg.RoomID, room, msg.EventID, "the cleanup command")
 	if removed < len(notices) {
 		return fmt.Sprintf("Removed %d of %d — the rest would not go.", removed, len(notices))
 	}
