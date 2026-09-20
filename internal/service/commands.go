@@ -130,13 +130,16 @@ func (s *Service) handleCommand(ctx context.Context, msg *bridge.Message, room c
 	case "/status":
 		reply = s.commandStatus(ctx, msg, room)
 	case "/clear", "/clean":
-		reply = s.commandClean(ctx, msg, room, args)
+		reply = s.commandClear(ctx, msg, room, args)
 	default:
 		reply = fmt.Sprintf("`%s` is not a command. `/help` for the list; `//%s` sends it as a message.",
 			command, strings.TrimPrefix(body, "/"))
 	}
 	if reply != "" {
 		s.postNotice(ctx, msg, room, reply)
+		// Now that there is something to take back, the command gets the
+		// button that takes it.
+		s.addClearButton(ctx, msg, room)
 	}
 }
 

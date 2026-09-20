@@ -387,7 +387,7 @@ func TestNoticeBookkeeping(t *testing.T) {
 	if left, err := st.Notices(ctx, "chat", "", 0); err != nil || len(left) != 1 {
 		t.Fatalf("after deleting two, %d left (%v)", len(left), err)
 	}
-	// Deleting nothing is not an error: /clear with nothing to clean.
+	// Deleting nothing is not an error: /clear with nothing to remove.
 	if err := st.DeleteNotices(ctx, nil); err != nil {
 		t.Fatal(err)
 	}

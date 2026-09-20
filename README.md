@@ -292,15 +292,19 @@ would be worse than a marker.
 
 That is what makes clearing up cheap. `/clear` removes the last bridge message
 and `/clear all` every one in the current conversation (`/clean` is an alias for
-both); **reacting to one of
-your own command messages** removes that message together with everything the
-bridge answered — a bridge message cannot be reacted to, so the command is the
-only handle there is. Any reaction does it by default:
+both). There are two ways to do it without typing anything, and both exist
+because **a bridge message cannot be reacted to at all** — only your own can:
+
+- **the delete button.** The bot puts a 🗑️ on every command you type. Tapping
+  it sends the same reaction from you, which is the press: the command and
+  everything the bridge answered go together. The button goes with them.
+- **deleting the command message.** The question and the answer are one
+  exchange, so removing the question removes the answer.
 
 ```yaml
 notices:
-  clean_on_reaction: true
-  clean_emoji: []        # empty = any; list a few to keep the rest free
+  clear_button: true     # the bot's reaction on your commands
+  clear_emoji: "🗑️"      # which reaction that is
   format_commands: true  # rewrite your `/command` as inline code
 ```
 

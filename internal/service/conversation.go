@@ -647,9 +647,12 @@ func isTimeout(err error) bool {
 		strings.Contains(text, "connection refused")
 }
 
-// onRedaction cancels a running turn when I delete the message that started
-// it — the one way to stop a model that is answering the wrong question.
+// onRedaction reacts to me deleting one of my own messages: a turn in flight
+// is cancelled — the one way to stop a model that is answering the wrong
+// question — and a command takes the bridge's answer to it with it.
 func (s *Service) onRedaction(ctx context.Context, roomKey string, roomID id.RoomID, target id.EventID) {
+	s.clearDeletedCommand(ctx, roomKey, roomID, target)
+
 	s.turnMu.Lock()
 	var found *runningTurn
 	for key, turn := range s.turns {

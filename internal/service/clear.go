@@ -22,13 +22,14 @@ import (
 //
 //   - /clear (or its older name /clean), which takes the last one — or all of
 //     them, in this conversation;
-//   - a reaction on the command I typed, which takes that message and
-//     everything the bridge said in answer to it.
+//   - the delete button: a reaction the bot puts on the command I typed.
+//     Tapping it sends the same reaction from me, and that is the press;
+//   - deleting the command message myself, which takes its answer with it.
 //
-// Both rely on the redaction path hiding the tombstone (bridge/send.go), so a
-// cleaned message leaves nothing at all behind.
+// All three rely on the redaction path hiding the tombstone (bridge/send.go),
+// so a cleared message leaves nothing at all behind.
 
-func (s *Service) commandClean(ctx context.Context, msg *bridge.Message, room config.Room, args string) string {
+func (s *Service) commandClear(ctx context.Context, msg *bridge.Message, room config.Room, args string) string {
 	all := strings.EqualFold(strings.TrimSpace(args), "all")
 	thread := msg.ThreadRoot.String()
 
@@ -53,14 +54,14 @@ func (s *Service) commandClean(ctx context.Context, msg *bridge.Message, room co
 		return "Could not read what I have said here: " + err.Error()
 	}
 
-	// A command and its answer are one exchange: cleaning the answer and
+	// A command and its answer are one exchange: clearing the answer and
 	// leaving "/help" behind would tidy up half of it.
-	commands, err := s.commandsToClean(ctx, msg, notices, all, since)
+	commands, err := s.commandsToClear(ctx, msg, notices, all, since)
 	if err != nil {
 		return "Could not read the commands here: " + err.Error()
 	}
 	if len(notices) == 0 && len(commands) == 0 {
-		return "Nothing of mine left to clean up."
+		return "Nothing of mine left to clear."
 	}
 
 	removed := s.removeNotices(ctx, msg.RoomID, notices)
@@ -69,6 +70,7 @@ func (s *Service) commandClean(ctx context.Context, msg *bridge.Message, room co
 		if command == msg.EventID.String() {
 			continue // this /clear is redacted below, whatever else happens
 		}
+		s.dropButton(ctx, msg.RoomID, room, command)
 		s.redactMine(ctx, msg.RoomID, room, id.EventID(command), "a command")
 		gone = append(gone, command)
 	}
@@ -86,11 +88,11 @@ func (s *Service) commandClean(ctx context.Context, msg *bridge.Message, room co
 	return ""
 }
 
-// commandsToClean is the set of my own command messages that go with the
+// commandsToClear is the set of my own command messages that go with the
 // bridge messages being removed: the ones that caused them, plus — when
-// cleaning the whole conversation — every command in it, including the ones
+// clearing the whole conversation — every command in it, including the ones
 // whose answer left no trace.
-func (s *Service) commandsToClean(ctx context.Context, msg *bridge.Message, notices []*store.Notice, all bool, since int64) ([]string, error) {
+func (s *Service) commandsToClear(ctx context.Context, msg *bridge.Message, notices []*store.Notice, all bool, since int64) ([]string, error) {
 	seen := make(map[string]bool, len(notices))
 	var out []string
 	add := func(eventID string) {
@@ -116,10 +118,42 @@ func (s *Service) commandsToClean(ctx context.Context, msg *bridge.Message, noti
 	return out, nil
 }
 
-// cleanForCommand is the reaction path: sweep away one of my messages and
-// everything the bridge said in answer to it. Reports whether it did anything.
-func (s *Service) cleanForCommand(ctx context.Context, evt *bridge.Reaction, room config.Room) bool {
-	if !s.conf().Notices.CleanTriggeredBy(evt.Key) {
+// addClearButton puts the delete button on a command I have just typed.
+//
+// A bridge message cannot be reacted to at all, so there is no way to offer an
+// action ON the answer. A reaction the bot has already placed on MY message
+// can be tapped though, and tapping it sends the same reaction from me — which
+// is exactly the signal clearForCommand is waiting for. The bot places the
+// button; my tap is the press.
+func (s *Service) addClearButton(ctx context.Context, msg *bridge.Message, room config.Room) {
+	notices := s.conf().Notices
+	if !notices.HasClearButton() {
+		return
+	}
+	// A command that took itself away (/clear) has nothing left to hang a
+	// button on: its row went with it.
+	if command, err := s.store.Command(ctx, msg.EventID.String()); err != nil || command == nil {
+		return
+	}
+	sender := bridge.BotKey
+	if notices.Sender != config.NoticeSenderBot && len(room.Ghosts) > 0 {
+		sender = room.Ghosts[0]
+	}
+	button, err := s.bridge.React(ctx, msg.RoomID, sender, msg.EventID, notices.ClearEmojiOr())
+	if err != nil {
+		s.log.Debug().Err(err).Msg("Could not put the delete button on a command")
+		return
+	}
+	if err := s.store.SetCommandButton(ctx, msg.EventID.String(), button.String()); err != nil {
+		s.log.Debug().Err(err).Msg("Could not remember a delete button")
+	}
+}
+
+// clearForCommand is the button being pressed: sweep away one of my commands
+// and everything the bridge said in answer to it. Reports whether it did
+// anything, because a reaction that clears nothing may still be an action.
+func (s *Service) clearForCommand(ctx context.Context, evt *bridge.Reaction, room config.Room) bool {
+	if !s.conf().Notices.ClearTriggeredBy(evt.Key) {
 		return false
 	}
 	notices, err := s.store.NoticesForCommand(ctx, evt.Target.String())
@@ -128,14 +162,47 @@ func (s *Service) cleanForCommand(ctx context.Context, evt *bridge.Reaction, roo
 	}
 	roomID := id.RoomID(notices[0].RoomID)
 	s.removeNotices(ctx, roomID, notices)
-	// The command, and then the reaction that asked for this — otherwise the
-	// reaction is left pointing at an event that no longer exists.
+	// The button, the command, and then the reaction that asked for this —
+	// otherwise both reactions are left pointing at an event that no longer
+	// exists.
+	s.dropButton(ctx, roomID, room, evt.Target.String())
 	s.redactMine(ctx, roomID, room, evt.Target, "the reacted command")
 	if err := s.store.DeleteCommands(ctx, []string{evt.Target.String()}); err != nil {
-		s.log.Debug().Err(err).Msg("Could not forget the cleaned command")
+		s.log.Debug().Err(err).Msg("Could not forget the cleared command")
 	}
-	s.redactMine(ctx, roomID, room, evt.EventID, "the cleaning reaction")
+	s.redactMine(ctx, roomID, room, evt.EventID, "the button press")
 	return true
+}
+
+// clearDeletedCommand is the other half of that: a command I delete myself
+// takes the bridge's answer with it. A command and its answer are one
+// exchange, and half of one left in the room is litter — so deleting the
+// question is the second way to delete the answer, and needs no button.
+func (s *Service) clearDeletedCommand(ctx context.Context, roomKey string, roomID id.RoomID, target id.EventID) {
+	command, err := s.store.Command(ctx, target.String())
+	if err != nil || command == nil {
+		return // not a command of mine; nothing here to answer for
+	}
+	room := s.conf().Rooms[roomKey]
+	s.dropButton(ctx, roomID, room, target.String())
+	if notices, err := s.store.NoticesForCommand(ctx, target.String()); err != nil {
+		s.log.Debug().Err(err).Msg("Could not read what a deleted command caused")
+	} else if len(notices) > 0 {
+		s.removeNotices(ctx, roomID, notices)
+	}
+	if err := s.store.DeleteCommands(ctx, []string{target.String()}); err != nil {
+		s.log.Debug().Err(err).Msg("Could not forget a deleted command")
+	}
+}
+
+// dropButton takes the bot's delete button off a command that is about to
+// disappear, so it is not left pointing at an event that no longer exists.
+func (s *Service) dropButton(ctx context.Context, roomID id.RoomID, room config.Room, commandEvent string) {
+	command, err := s.store.Command(ctx, commandEvent)
+	if err != nil || command == nil || command.ButtonEvent == "" {
+		return
+	}
+	s.redactMine(ctx, roomID, room, id.EventID(command.ButtonEvent), "a delete button")
 }
 
 // removeNotices redacts bridge messages and forgets them. Each is redacted by

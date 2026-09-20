@@ -512,7 +512,7 @@ func (s *Service) onReaction(ctx context.Context, evt *bridge.Reaction) {
 	// together with whatever the bridge answered — a bridge message cannot be
 	// reacted to, so the command is the only handle there is. It is never an
 	// action: my own messages declare none.
-	if evt.Sender == s.bridge.UserID() && s.cleanForCommand(ctx, evt, room) {
+	if evt.Sender == s.bridge.UserID() && s.clearForCommand(ctx, evt, room) {
 		return
 	}
 

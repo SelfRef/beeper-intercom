@@ -484,14 +484,18 @@ type Notices struct {
 	// Reply sends a notice caused by a command as a reply to that command.
 	Reply *bool `yaml:"reply"`
 
-	// CleanOnReaction makes any reaction to one of MY command messages remove
-	// that message and everything the bridge said in answer to it. It is the
-	// fastest way to tidy up, because a bridge message cannot be reacted to
-	// itself — only my own can. On by default; `/clear` does the same thing
-	// without a reaction.
-	CleanOnReaction *bool `yaml:"clean_on_reaction"`
-	// CleanEmoji limits which reactions do that. Empty means any of them.
-	CleanEmoji []string `yaml:"clean_emoji"`
+	// ClearButton puts a reaction on every command I type, which works as a
+	// delete button on the bridge's answer: tapping it adds the same reaction
+	// from me, and that is the signal to sweep the command and everything the
+	// bridge said in answer to it. It has to be done this way round because a
+	// bridge message cannot be reacted to at all — only my own can, and a
+	// reaction the bot already placed is one tap away. On by default; `/clear`
+	// does the same thing without a reaction, and deleting the command message
+	// itself takes the answer with it either way.
+	ClearButton *bool `yaml:"clear_button"`
+	// ClearEmoji is which reaction that is. A wastebasket by default, because
+	// the button has to say what it does with no label.
+	ClearEmoji string `yaml:"clear_emoji"`
 
 	// FormatCommands rewrites a command I typed as inline code, so `/help`
 	// reads as a command rather than as something I said. The bridge cannot
@@ -501,23 +505,29 @@ type Notices struct {
 	FormatCommands bool `yaml:"format_commands"`
 }
 
-// CleansOnReaction defaults to true.
-func (n Notices) CleansOnReaction() bool { return n.CleanOnReaction == nil || *n.CleanOnReaction }
+// HasClearButton defaults to true.
+func (n Notices) HasClearButton() bool { return n.ClearButton == nil || *n.ClearButton }
 
-// CleanTriggeredBy reports whether this reaction key is one that cleans.
-func (n Notices) CleanTriggeredBy(key string) bool {
-	if !n.CleansOnReaction() {
-		return false
+// ClearKey is the reaction the button uses, wastebasket by default.
+const ClearKey = "🗑️"
+
+// ClearEmojiOr is the configured button emoji, or the default.
+func (n Notices) ClearEmojiOr() string {
+	if n.ClearEmoji == "" {
+		return ClearKey
 	}
-	if len(n.CleanEmoji) == 0 {
-		return true
-	}
-	for _, allowed := range n.CleanEmoji {
-		if allowed == key {
-			return true
-		}
-	}
-	return false
+	return n.ClearEmoji
+}
+
+// ClearTriggeredBy reports whether this reaction key is the button being
+// pressed. Emoji reach the bridge with or without the variation selector
+// depending on the client, and the two are the same picture.
+func (n Notices) ClearTriggeredBy(key string) bool {
+	return n.HasClearButton() && sameEmoji(key, n.ClearEmojiOr())
+}
+
+func sameEmoji(a, b string) bool {
+	return strings.ReplaceAll(a, "\ufe0f", "") == strings.ReplaceAll(b, "\ufe0f", "")
 }
 
 // RepliesToCommands defaults to true: a bridge answer belongs to the message

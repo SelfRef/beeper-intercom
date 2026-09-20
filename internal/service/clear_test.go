@@ -11,24 +11,26 @@ import (
 	"github.com/SelfRef/beeper-intercom/internal/config"
 )
 
-// Which reactions sweep a command away. The default is "any", because the
-// point is to be faster than typing /clear.
-func TestCleanTriggeredBy(t *testing.T) {
+// The delete button: the bot puts one reaction on my command, and only that
+// same reaction coming back from me is the press. On by default, because the
+// point is to be one tap rather than typing /clear.
+func TestClearTriggeredBy(t *testing.T) {
 	off := false
 	for name, tc := range map[string]struct {
 		cfg  config.Notices
 		key  string
 		want bool
 	}{
-		"default, any emoji":    {config.Notices{}, "🧹", true},
-		"default, another one":  {config.Notices{}, "👍", true},
-		"disabled":              {config.Notices{CleanOnReaction: &off}, "🧹", false},
-		"limited, listed":       {config.Notices{CleanEmoji: []string{"🧹", "🗑️"}}, "🗑️", true},
-		"limited, not listed":   {config.Notices{CleanEmoji: []string{"🧹"}}, "👍", false},
-		"disabled beats a list": {config.Notices{CleanOnReaction: &off, CleanEmoji: []string{"🧹"}}, "🧹", false},
+		"the default button":     {config.Notices{}, "🗑️", true},
+		"without its selector":   {config.Notices{}, "🗑", true},
+		"some other reaction":    {config.Notices{}, "👍", false},
+		"disabled":               {config.Notices{ClearButton: &off}, "🗑️", false},
+		"a configured button":    {config.Notices{ClearEmoji: "❌"}, "❌", true},
+		"not the configured one": {config.Notices{ClearEmoji: "❌"}, "🗑️", false},
+		"disabled beats a key":   {config.Notices{ClearButton: &off, ClearEmoji: "❌"}, "❌", false},
 	} {
-		if got := tc.cfg.CleanTriggeredBy(tc.key); got != tc.want {
-			t.Errorf("%s: CleanTriggeredBy(%q) = %v, want %v", name, tc.key, got, tc.want)
+		if got := tc.cfg.ClearTriggeredBy(tc.key); got != tc.want {
+			t.Errorf("%s: ClearTriggeredBy(%q) = %v, want %v", name, tc.key, got, tc.want)
 		}
 	}
 }

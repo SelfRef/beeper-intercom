@@ -13,7 +13,7 @@ import (
 // message normally leaves a tombstone ("This message has been deleted"), which
 // for the bridge bot renders as a left-aligned bubble with a raw MXID in it —
 // louder than the dim centred notice it replaced. `delete_hide_placeholder`
-// makes a redaction disappear instead, which is what a bridge cleaning up
+// makes a redaction disappear instead, which is what a bridge clearing up
 // after itself wants. Rooms can ask for the tombstones back
 // (`delete_placeholder: true`), because in a room full of announcements a
 // silent disappearance can be worse than a marker.

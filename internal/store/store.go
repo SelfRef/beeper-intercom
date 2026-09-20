@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS commands (
 	room_id     TEXT NOT NULL,
 	body        TEXT NOT NULL,
 	session_id  INTEGER NOT NULL DEFAULT 0,
+	button_event TEXT NOT NULL DEFAULT '',
 	created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_commands_slot ON commands (room_key, thread_root, created_at);
@@ -218,6 +219,7 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE turns ADD COLUMN question TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE turns ADD COLUMN usage TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE turns ADD COLUMN answer_events TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE commands ADD COLUMN button_event TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -832,25 +834,37 @@ type Command struct {
 	RoomID     string
 	Body       string
 	SessionID  int64
-	CreatedAt  int64
+	// ButtonEvent is the bot's own reaction on this command: the delete
+	// button. Kept so it can be taken away with the command it belongs to,
+	// instead of being left pointing at an event that no longer exists.
+	ButtonEvent string
+	CreatedAt   int64
 }
 
-const commandCols = `event_id, room_key, thread_root, room_id, body, session_id, created_at`
+const commandCols = `event_id, room_key, thread_root, room_id, body, session_id, button_event, created_at`
 
 // PutCommand records a command, or updates the text of one that was edited.
 // created_at is deliberately NOT refreshed: an edited command keeps its place
 // in the order, so editing an old one cannot make it look like the newest.
 func (s *Store) PutCommand(ctx context.Context, c *Command) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO commands (`+commandCols+`) VALUES (?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO commands (`+commandCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(event_id) DO UPDATE SET body = excluded.body, session_id = excluded.session_id`,
-		c.EventID, c.RoomKey, c.ThreadRoot, c.RoomID, c.Body, c.SessionID, now())
+		c.EventID, c.RoomKey, c.ThreadRoot, c.RoomID, c.Body, c.SessionID, c.ButtonEvent, now())
+	return err
+}
+
+// SetCommandButton records the delete button the bot put on a command.
+func (s *Store) SetCommandButton(ctx context.Context, eventID, buttonEvent string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE commands SET button_event = ? WHERE event_id = ?`, buttonEvent, eventID)
 	return err
 }
 
 func scanCommand(scan func(dest ...any) error) (*Command, error) {
 	var c Command
-	if err := scan(&c.EventID, &c.RoomKey, &c.ThreadRoot, &c.RoomID, &c.Body, &c.SessionID, &c.CreatedAt); err != nil {
+	if err := scan(&c.EventID, &c.RoomKey, &c.ThreadRoot, &c.RoomID, &c.Body, &c.SessionID,
+		&c.ButtonEvent, &c.CreatedAt); err != nil {
 		return nil, err
 	}
 	return &c, nil
