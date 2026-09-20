@@ -168,9 +168,14 @@ func (o *openWebUI) Send(ctx context.Context, conv Conversation, turn Turn, sink
 	if len(resp.Choices) == 0 {
 		return nil, fmt.Errorf("open webui returned no choices")
 	}
+	// content and reasoning_content are separate fields. A reasoning model
+	// that spends its whole budget thinking comes back with an empty answer;
+	// showing the reasoning is more useful than an empty bubble, but it has to
+	// be labelled as what it is rather than passed off as the answer.
 	text := resp.Choices[0].Message.Content
-	if text == "" {
-		text = resp.Choices[0].Message.ReasoningContent
+	if text == "" && resp.Choices[0].Message.ReasoningContent != "" {
+		text = "*No answer — the model returned only its reasoning:*\n\n" +
+			resp.Choices[0].Message.ReasoningContent
 	}
 	return &Reply{Text: text, Parent: assistantID, Link: o.Link(conv.ID)}, nil
 }

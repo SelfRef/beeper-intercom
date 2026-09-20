@@ -169,7 +169,10 @@ func (b *Bridge) createRoom(ctx context.Context, key string, room config.Room, a
 		// Without this the account owner's membership sticks at "invite" and
 		// the room shows up empty and broken.
 		BeeperAutoJoinInvites: true,
-		BeeperBridgeName:      b.conf().Network.Bridge,
+		// NOT com.beeper.bridge_name: hungryserv rejects the create outright
+		// ("no beeper bridge details should be provided for unknown room IDs")
+		// unless a local room ID comes with it. The m.bridge state below is
+		// what actually groups the room under its network.
 	}
 	resp, err := b.BotIntent().CreateRoom(ctx, req)
 	if err != nil {

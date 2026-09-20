@@ -115,6 +115,10 @@ agents:
 # Sources are inbound adapters. Every one of them produces the same internal
 # notification, so rooms, dedupe, threads and actions never learn where a
 # message came from.
+#
+# NOTE: unlike the rest of this file, sources are NOT hot-reloaded — each one
+# is a live stream with its own cursor. Restart the process after changing
+# them.
 sources:
   # The native POST /v1/notify API. Always available; listed for symmetry.
   - type: notify

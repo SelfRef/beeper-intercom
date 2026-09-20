@@ -78,6 +78,7 @@ func New(cfg *config.Config, configPath string, st *store.Store, log zerolog.Log
 		agents:     map[string]agent.Agent{},
 		queue:      make(chan *sendJob, cfg.Limits.QueueSize),
 		turns:      map[string]*runningTurn{},
+		ready:      make(chan struct{}),
 		startedAt:  time.Now(),
 	}
 	s.cfg.Store(cfg)

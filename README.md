@@ -256,8 +256,10 @@ config renames the room rather than creating a second one.
 - `dm` — the same, rendered as a direct message. Needs exactly one ghost.
 
 Config is reloaded on `SIGHUP` or `POST /v1/reload`: rooms reconcile, ghosts
-refresh, sessions survive. The registration name is the one thing that cannot
-change that way — it decides which appservice this process *is*.
+refresh, agents are rebuilt, sessions survive. Two things do not reload —
+**sources** (an ntfy subscription is a live stream with a cursor, so a changed
+topic list needs a restart) and the **registration name**, which decides which
+appservice this process *is*.
 
 `${VAR}` is expanded anywhere in the config file. Secrets should not be in it
 at all: the fields that need one name an environment variable instead.

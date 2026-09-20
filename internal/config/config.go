@@ -143,10 +143,12 @@ type Agent struct {
 	Model     string `yaml:"model"`
 
 	// openwebui: the sidebar folder chats are filed under, the per-room tool
-	// set, and the extra tool servers the room may reach.
-	Folder      string   `yaml:"folder"`
-	ToolIDs     []string `yaml:"tool_ids"`
-	ToolServers []string `yaml:"tool_servers"`
+	// set, and any direct tool servers the room may reach. ToolServers is
+	// passed through verbatim, because Open WebUI wants whole server objects
+	// (url, auth, spec) there rather than names.
+	Folder      string           `yaml:"folder"`
+	ToolIDs     []string         `yaml:"tool_ids"`
+	ToolServers []map[string]any `yaml:"tool_servers"`
 
 	// openai: the bridge keeps the transcript, so it needs to know how much of
 	// it to replay and what to put in front of it.
