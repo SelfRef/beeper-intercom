@@ -63,6 +63,20 @@ func (o *openAI) Send(ctx context.Context, conv Conversation, turn Turn, sink Si
 		messages = append(messages, map[string]string{"role": entry.Role, "content": entry.Content})
 	}
 	messages = append(messages, map[string]string{"role": "user", "content": turn.Text})
+	// Images go in as OpenAI vision parts; anything else is named so the model
+	// knows something was sent that it cannot see.
+	var userContent any = turn.Text
+	if len(turn.Attachments) > 0 {
+		parts := []map[string]any{{"type": "text", "text": turn.Text}}
+		for _, att := range turn.Attachments {
+			if strings.HasPrefix(att.Mime, "image/") {
+				parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": dataURL(att)}})
+			} else {
+				parts[0]["text"] = parts[0]["text"].(string) + fmt.Sprintf("\n\n(attached file %q, %s, %d bytes — not readable by this backend)", att.Name, att.Mime, len(att.Data))
+			}
+		}
+		userContent = parts
+	}
 
 	model := conv.Model
 	if model == "" {
@@ -73,7 +87,15 @@ func (o *openAI) Send(ctx context.Context, conv Conversation, turn Turn, sink Si
 	}
 
 	stream := sink.Delta != nil && !o.cfg.NoStream
-	body := map[string]any{"model": model, "messages": messages, "stream": stream}
+	payload := make([]any, 0, len(messages))
+	for i, m := range messages {
+		if i == len(messages)-1 {
+			payload = append(payload, map[string]any{"role": "user", "content": userContent})
+		} else {
+			payload = append(payload, m)
+		}
+	}
+	body := map[string]any{"model": model, "messages": payload, "stream": stream}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -170,3 +192,9 @@ func (o *openAI) readStream(body io.Reader, sink Sink) (string, error) {
 // Cancel is a no-op: a plain completions endpoint has nothing to cancel
 // beyond dropping the request, which the caller's context already does.
 func (o *openAI) Cancel(context.Context, string) error { return nil }
+
+// Transcribe uses the same endpoint family's /audio/transcriptions, which
+// llama.cpp's server and most OpenAI-compatible stacks provide.
+func (o *openAI) Transcribe(ctx context.Context, att Attachment) (string, error) {
+	return postTranscription(ctx, o.client, strings.TrimSuffix(o.cfg.URL, "/")+"/audio/transcriptions", o.cfg.Key(), o.cfg.Headers, att, o.cfg.Model)
+}

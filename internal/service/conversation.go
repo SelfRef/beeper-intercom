@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -141,8 +142,14 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 		}
 	}
 
+	turn, err := s.buildTurn(turnCtx, msg, room, backend, ghostKey)
+	if err != nil {
+		s.reportFailure(ctx, msg, err)
+		return
+	}
+
 	conv := agent.Conversation{ID: sess.ConvID, Parent: parent, Model: sess.Model, Turns: sess.Turns}
-	reply, err := backend.Send(turnCtx, conv, agent.Turn{Text: msg.Body}, sink)
+	reply, err := backend.Send(turnCtx, conv, turn, sink)
 	streamMu.Lock()
 	opened := stream
 	streamMu.Unlock()
@@ -180,6 +187,60 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 	}); err != nil {
 		s.log.Error().Err(err).Msg("Failed to record turn")
 	}
+}
+
+// buildTurn turns the message into what the backend gets: the text, plus any
+// attachment — an image for a vision model, a document for the file path, or
+// a voice message transcribed first.
+func (s *Service) buildTurn(ctx context.Context, msg *bridge.Message, room config.Room, backend agent.Agent, ghostKey string) (agent.Turn, error) {
+	turn := agent.Turn{Text: msg.Body}
+	att := msg.Attachment
+	if att == nil {
+		return turn, nil
+	}
+
+	data, err := s.bridge.DownloadMedia(ctx, att.URL, s.conf().Limits.MaxMediaBytes)
+	if err != nil {
+		return turn, fmt.Errorf("download attachment: %w", err)
+	}
+	file := agent.Attachment{Name: att.Name, Mime: att.Mime, Data: data}
+	if file.Mime == "" {
+		file.Mime = "application/octet-stream"
+	}
+	if file.Name == "" {
+		file.Name = "attachment"
+	}
+
+	if att.Voice || (att.Kind == event.MsgAudio && msg.Body == "") {
+		transcript, err := backend.Transcribe(ctx, file)
+		if err != nil {
+			if errors.Is(err, agent.ErrUnsupported) {
+				return turn, fmt.Errorf("this agent cannot transcribe voice messages")
+			}
+			return turn, fmt.Errorf("transcribe: %w", err)
+		}
+		if transcript == "" {
+			return turn, fmt.Errorf("the voice message came back empty from transcription")
+		}
+		// The transcript is shown so a misheard word explains a strange answer.
+		s.postNotice(ctx, msg, room, "🎙️ "+transcript)
+		if turn.Text != "" {
+			turn.Text += "\n\n"
+		}
+		turn.Text += transcript
+		return turn, nil
+	}
+
+	turn.Attachments = []agent.Attachment{file}
+	if turn.Text == "" {
+		// No caption: give the model something to do with what it was sent.
+		if strings.HasPrefix(file.Mime, "image/") {
+			turn.Text = "What is in this image?"
+		} else {
+			turn.Text = fmt.Sprintf("I sent you the file %q. Summarise what it contains.", file.Name)
+		}
+	}
+	return turn, nil
 }
 
 // postAnswer renders and sends the answer, splitting it at paragraph

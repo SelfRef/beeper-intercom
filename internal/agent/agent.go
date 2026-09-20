@@ -6,6 +6,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -60,7 +61,24 @@ type Turn struct {
 	// Internal marks a turn the bridge generated (the summary request on
 	// rotation), so an adapter can skip side effects such as title generation.
 	Internal bool
+	// Attachments are files sent with the message: images for a vision model,
+	// documents for whatever the backend does with documents.
+	Attachments []Attachment
 }
+
+// Attachment is one file in a turn.
+type Attachment struct {
+	Name string
+	Mime string
+	Data []byte
+
+	// uploaded is the backend's record of this file once an adapter has stored
+	// it, so a retry of the same turn does not upload twice.
+	uploaded map[string]any
+}
+
+// ErrUnsupported is returned by an adapter for a capability it does not have.
+var ErrUnsupported = errors.New("not supported by this agent")
 
 // Reply is what came back.
 type Reply struct {
@@ -96,6 +114,8 @@ type Agent interface {
 	Cancel(ctx context.Context, convID string) error
 	// Link is where a human continues this conversation.
 	Link(convID string) string
+	// Transcribe turns a voice message into text, or returns ErrUnsupported.
+	Transcribe(ctx context.Context, att Attachment) (string, error)
 }
 
 // New builds the adapter named by a config entry.

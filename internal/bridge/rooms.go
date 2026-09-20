@@ -37,7 +37,10 @@ func (b *Bridge) Reconcile(ctx context.Context) error {
 	if err := b.reconcileGhosts(ctx); err != nil {
 		return err
 	}
-	return b.reconcileRooms(ctx)
+	if err := b.reconcileRooms(ctx); err != nil {
+		return err
+	}
+	return b.reconcileStatusRoom(ctx)
 }
 
 func (b *Bridge) reconcileGhosts(ctx context.Context) error {

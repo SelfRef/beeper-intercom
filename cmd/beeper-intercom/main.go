@@ -84,6 +84,7 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Cannot build the service")
 	}
+	svc.Version = version
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

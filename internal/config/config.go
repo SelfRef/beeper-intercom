@@ -52,6 +52,10 @@ type Network struct {
 	Avatar string `yaml:"avatar"`
 	// ExternalURL is the protocol's homepage, shown in some client surfaces.
 	ExternalURL string `yaml:"external_url"`
+	// StatusRoom, when named, is a bridge-bot room where the bridge itself
+	// reports connection changes, reloads and delivery failures as dim
+	// centred notices instead of log lines. Empty turns it off.
+	StatusRoom string `yaml:"status_room"`
 }
 
 // Matrix is the account side: which Beeper deployment, and the account token

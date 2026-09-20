@@ -322,6 +322,24 @@ func msgTypeFor(mime string) event.MessageType {
 	}
 }
 
+// DownloadMedia fetches an attachment the account owner sent. Rooms are
+// unencrypted, so the appservice token can read it directly.
+func (b *Bridge) DownloadMedia(ctx context.Context, uri id.ContentURI, limit int64) ([]byte, error) {
+	resp, err := b.BotIntent().Download(ctx, uri)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("attachment larger than the %d byte limit", limit)
+	}
+	return data, nil
+}
+
 // React adds a reaction as a ghost — used for the ⚙️ "working on it" marker.
 func (b *Bridge) React(ctx context.Context, roomID id.RoomID, ghostKey string, target id.EventID, key string) (id.EventID, error) {
 	resp, err := b.Intent(ghostKey).SendReaction(ctx, roomID, target, key)

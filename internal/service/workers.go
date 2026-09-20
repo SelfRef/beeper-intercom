@@ -73,6 +73,12 @@ func (s *Service) attemptDelivery(ctx context.Context, client *http.Client, deli
 		s.log.Error().Err(err2).Msg("Failed to record delivery failure")
 	}
 	s.log.Warn().Err(err).Int("attempt", attempts).Str("url", delivery.URL).Msg("Delivery failed")
+	if status == "failed" {
+		// Out of retries: the action is lost unless someone retries it by hand,
+		// which is worth a line in the status room rather than only in the logs.
+		s.bridge.Status(ctx, fmt.Sprintf("Delivery #%d to %s gave up after %d attempts (%s). `POST /v1/deliveries/%d/retry` to try again.",
+			delivery.ID, delivery.URL, attempts, err, delivery.ID))
+	}
 }
 
 // cleanupWorker trims history. Notifications outlive deliveries because a

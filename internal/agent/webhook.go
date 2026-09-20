@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -87,6 +88,16 @@ func (w *webhook) Send(ctx context.Context, conv Conversation, turn Turn, sink S
 		// Tells the sidecar it may stream; one that cannot just answers JSON.
 		"stream": sink.Delta != nil && !w.cfg.NoStream,
 	}
+	if len(turn.Attachments) > 0 {
+		atts := make([]map[string]any, 0, len(turn.Attachments))
+		for _, att := range turn.Attachments {
+			atts = append(atts, map[string]any{
+				"name": att.Name, "mime": att.Mime, "size": len(att.Data),
+				"data_base64": base64.StdEncoding.EncodeToString(att.Data),
+			})
+		}
+		body["attachments"] = atts
+	}
 	resp, err := w.post(ctx, "/turn", body)
 	if err != nil {
 		return nil, err
@@ -142,6 +153,24 @@ func (w *webhook) readStream(body io.Reader, sink Sink) (*Reply, error) {
 		return nil, fmt.Errorf("webhook agent returned an empty answer")
 	}
 	return &Reply{Text: text, Link: final.Link}, nil
+}
+
+// Transcribe asks the sidecar: POST /transcribe with the audio as base64,
+// expecting {"text": "..."}. A 404 means it does not do voice.
+func (w *webhook) Transcribe(ctx context.Context, att Attachment) (string, error) {
+	var resp struct {
+		Text string `json:"text"`
+	}
+	err := w.do(ctx, "/transcribe", map[string]any{
+		"name": att.Name, "mime": att.Mime, "data_base64": base64.StdEncoding.EncodeToString(att.Data),
+	}, &resp)
+	if isNotFound(err) {
+		return "", ErrUnsupported
+	}
+	if err != nil {
+		return "", err
+	}
+	return resp.Text, nil
 }
 
 func (w *webhook) Cancel(ctx context.Context, convID string) error {

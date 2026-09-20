@@ -110,7 +110,7 @@ curl -X POST http://intercom:8080/v1/notify \
 | `tags` | known ntfy shortcodes become emoji, the rest become hashtags |
 | `media` | downloaded and re-uploaded, so the client never reaches into your network |
 | `source` | kept with the message, so a later reaction or thread has the payload |
-| `thread` | an event ID, or `kind:id` naming an earlier notification's source |
+| `thread` | an event ID, or `kind:id` naming an earlier notification's source. If no earlier notification matches, the message becomes a root — so a publisher that always sends `thread: "frigate:<camera>"` gets one thread per camera without tracking event IDs |
 | `dedupe` | idempotency key; a repeat returns the first event ID |
 | `actions` | reaction key → action name (see below) |
 | `profile` | `{displayname, avatar_url}` — one ghost speaking as many authors |
@@ -157,6 +157,14 @@ other device and every reload sees. Clients without stream support show `…`
 until that edit lands. Set `no_stream: true` on an agent to get one message
 per answer instead.
 
+**Attachments.** Send a photo and a vision model sees it; send a document and
+it goes through the backend's file path (Open WebUI uploads it and runs it
+through RAG or full context, as the web UI would); send a **voice message**
+and it is transcribed first — the transcript is posted back as a notice, so a
+misheard word explains a strange answer, and the text becomes the turn. A
+caption becomes the question; without one the bridge asks the obvious
+("What is in this image?").
+
 Commands, handled before anything reaches the backend:
 
 | Command | Effect |
@@ -192,6 +200,10 @@ POST <url>/turn    {"conv_id": "…", "text": "…", "internal": false, "turns":
                    optionally ending with     data: {"text": "…", "link": "…"}
                    and                        data: [DONE]
 POST <url>/cancel  {"conv_id": "…"}            (optional endpoint; 404 is fine)
+POST <url>/transcribe {"name": "…", "mime": "audio/ogg", "data_base64": "…"}
+                   → {"text": "…"}              (optional; 404 = no voice support)
+
+Attachments arrive on /turn as "attachments": [{"name", "mime", "size", "data_base64"}].
 ```
 
 Replacing your agent later means pointing the `openai` adapter at the new thing
@@ -230,6 +242,15 @@ is the pattern for anything irreversible.
 Deliveries go through an outbox: the row exists before the HTTP call, so an
 action survives the receiver being restarted. `GET /v1/deliveries` and
 `POST /v1/deliveries/{id}/retry` are there when one does not.
+
+## The status room
+
+Name one with `network.status_room` and the bridge creates a bridge-bot room
+where it reports on itself: startup, reconnects after a drop, config reloads,
+deliveries that gave up. These render as the dim centred notices Beeper uses
+for bridge login prompts — that style needs both the room flag
+(`com.beeper.is_bridge_bot_room`) and the bridge bot as sender, so nothing
+else in the bridge can use it and the room never turns into a chat.
 
 ## Surfaces
 

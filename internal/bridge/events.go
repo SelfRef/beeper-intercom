@@ -33,6 +33,31 @@ func (b *Bridge) handleMessage(ctx context.Context, evt *event.Event) {
 		Content: content,
 		Time:    time.UnixMilli(evt.Timestamp),
 	}
+	switch content.MsgType {
+	case event.MsgImage, event.MsgFile, event.MsgAudio, event.MsgVideo:
+		if content.URL != "" {
+			if uri, err := content.URL.Parse(); err == nil {
+				msg.Attachment = &Attachment{
+					URL:   uri,
+					Name:  content.FileName,
+					Kind:  content.MsgType,
+					Voice: content.MSC3245Voice != nil,
+				}
+				if content.Info != nil {
+					msg.Attachment.Mime = content.Info.MimeType
+					msg.Attachment.Size = content.Info.Size
+				}
+				// Without a separate filename the body IS the filename, not a
+				// caption; with one, the body is whatever the user typed.
+				if content.FileName == "" {
+					msg.Attachment.Name = content.Body
+					msg.Body = ""
+				} else if content.Body == content.FileName {
+					msg.Body = ""
+				}
+			}
+		}
+	}
 	if rel := content.RelatesTo; rel != nil {
 		switch rel.Type {
 		case event.RelThread:

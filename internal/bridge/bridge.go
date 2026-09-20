@@ -67,6 +67,19 @@ type Message struct {
 	Edits   id.EventID
 	Content *event.MessageEventContent
 	Time    time.Time
+	// Attachment is set for image, file, audio and video messages. Body then
+	// holds the caption, if there is one, rather than the file name.
+	Attachment *Attachment
+}
+
+// Attachment is a file the account owner sent.
+type Attachment struct {
+	URL   id.ContentURI
+	Name  string
+	Mime  string
+	Size  int
+	Kind  event.MessageType
+	Voice bool
 }
 
 // Reaction is one inbound reaction.
@@ -113,10 +126,13 @@ type Bridge struct {
 	roomKey map[id.RoomID]string // room -> config key
 	ghosts  map[string]id.UserID // config key -> mxid
 
-	connected  bool
-	lastConnet time.Time
+	connected     bool
+	everConnected bool
+	lastConnet    time.Time
+	disconnectAt  time.Time
 
-	streams streamer
+	streams    streamer
+	statusRoom id.RoomID
 }
 
 // New prepares a bridge. Nothing talks to the network until Start.
@@ -205,16 +221,23 @@ func (b *Bridge) websocketLoop(ctx context.Context, onConnect func()) {
 		b.log.Debug().Msg("Connecting appservice websocket")
 		err := b.as.StartWebsocket(ctx, "", func() {
 			b.mu.Lock()
+			reconnect := b.everConnected
+			gap := time.Since(b.disconnectAt).Round(time.Second)
 			b.connected = true
+			b.everConnected = true
 			b.lastConnet = time.Now()
 			b.mu.Unlock()
 			backoff = time.Second
 			b.log.Info().Msg("Appservice websocket connected")
 			b.postBridgeState(ctx, status.StateConnected, "")
+			if reconnect {
+				b.Status(ctx, fmt.Sprintf("Reconnected to Beeper after %s.", gap))
+			}
 			onConnect()
 		})
 		b.mu.Lock()
 		b.connected = false
+		b.disconnectAt = time.Now()
 		b.mu.Unlock()
 		if ctx.Err() != nil {
 			return

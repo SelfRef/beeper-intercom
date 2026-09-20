@@ -45,6 +45,9 @@ type Service struct {
 	// ready closes once the rooms exist.
 	ready chan struct{}
 
+	// Version is reported in the status room on startup; main sets it.
+	Version string
+
 	turnMu  sync.Mutex
 	turns   map[string]*runningTurn // session key -> in-flight turn
 	waiters sync.Map                // poll event ID -> chan string
@@ -149,6 +152,8 @@ func (s *Service) Reload(ctx context.Context) error {
 		return fmt.Errorf("reconcile after reload: %w", err)
 	}
 	s.log.Info().Msg("Reloaded configuration")
+	s.bridge.Status(ctx, fmt.Sprintf("Configuration reloaded — %d rooms, %d ghosts, %d agents.",
+		len(next.Rooms), len(next.Ghosts), len(next.Agents)))
 	return nil
 }
 
@@ -195,6 +200,9 @@ func (s *Service) connectLoop(ctx context.Context) {
 		if err == nil {
 			close(s.ready)
 			s.log.Info().Msg("Bridge is ready")
+			cfg := s.conf()
+			s.bridge.Status(ctx, fmt.Sprintf("Bridge up — %s, %d rooms, %d ghosts, %d agents.",
+				s.Version, len(cfg.Rooms), len(cfg.Ghosts), len(cfg.Agents)))
 			return
 		}
 		s.log.Error().Err(err).Dur("retry_in", backoff).Msg("Could not bring the bridge up")
@@ -344,21 +352,28 @@ func (s *Service) resolveThread(ctx context.Context, thread string) (id.EventID,
 	if strings.HasPrefix(thread, "$") {
 		return id.EventID(thread), nil
 	}
-	if kind, sourceID, ok := strings.Cut(thread, ":"); ok {
-		if found, err := s.store.NotificationBySource(ctx, kind, sourceID); err != nil {
-			return "", err
-		} else if found != nil {
-			return threadRootOf(found), nil
-		}
-	}
 	found, err := s.store.NotificationByDedupe(ctx, thread)
 	if err != nil {
 		return "", err
 	}
-	if found == nil {
-		return "", fmt.Errorf("thread target %q not found", thread)
+	if found != nil {
+		return threadRootOf(found), nil
 	}
-	return threadRootOf(found), nil
+	if kind, sourceID, ok := strings.Cut(thread, ":"); ok {
+		found, err := s.store.NotificationBySource(ctx, kind, sourceID)
+		if err != nil {
+			return "", err
+		}
+		if found != nil {
+			return threadRootOf(found), nil
+		}
+		// "Thread with earlier notifications from this source, if any": the
+		// first one from a source has nothing to hang under, so it becomes the
+		// root the later ones will find. That is how one thread per chat, per
+		// camera or per job works without the publisher tracking event IDs.
+		return "", nil
+	}
+	return "", fmt.Errorf("thread target %q not found", thread)
 }
 
 // threadRootOf keeps threads one level deep: replying to something that is

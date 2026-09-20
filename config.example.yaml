@@ -17,8 +17,12 @@ network:
   id: intercom
   # What the client shows as the network name.
   name: Intercom
-  # Uploaded once and cached; the path is relative to this file.
+  # Uploaded once and cached; the path is relative to this file. Rooms inherit
+  # it unless they set their own; ghosts have their own `avatar:`.
   avatar: avatars/intercom.png
+  # Optional bridge-bot room where the bridge reports on itself (reconnects,
+  # reloads, deliveries that gave up) as dim centred notices.
+  status_room: Intercom — Status
 
 matrix:
   # api.<domain> and matrix.<domain>. Only change this for a non-production

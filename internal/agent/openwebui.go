@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"strings"
 	"sync"
 	"time"
@@ -148,6 +150,30 @@ func (o *openWebUI) turnRequest(conv Conversation, turn Turn, assistantID string
 	} else {
 		body["parent_id"] = conv.Parent
 	}
+	if len(turn.Attachments) > 0 {
+		// Images ride along as data URLs on the stored user message: the server
+		// rebuilds them into image_url parts on every replay, exactly as the web
+		// UI does. Documents were uploaded first (see attachFiles) and are
+		// referenced by id, which puts them through the same RAG/full-context
+		// path as a file dropped into the web UI.
+		var stored, metadata []map[string]any
+		for _, att := range turn.Attachments {
+			if strings.HasPrefix(att.Mime, "image/") {
+				stored = append(stored, map[string]any{"type": "image", "url": dataURL(att), "name": att.Name})
+				continue
+			}
+			if att.uploaded != nil {
+				stored = append(stored, att.uploaded)
+				metadata = append(metadata, att.uploaded)
+			}
+		}
+		if len(stored) > 0 {
+			userMessage["files"] = stored
+		}
+		if len(metadata) > 0 {
+			body["files"] = metadata
+		}
+	}
 	if len(o.cfg.ToolIDs) > 0 {
 		body["tool_ids"] = o.cfg.ToolIDs
 	}
@@ -158,6 +184,9 @@ func (o *openWebUI) turnRequest(conv Conversation, turn Turn, assistantID string
 }
 
 func (o *openWebUI) Send(ctx context.Context, conv Conversation, turn Turn, sink Sink) (*Reply, error) {
+	if err := o.attachFiles(ctx, &turn); err != nil {
+		return nil, err
+	}
 	if sink.Delta != nil && !o.cfg.NoStream {
 		return o.sendStreaming(ctx, conv, turn, sink)
 	}
@@ -319,6 +348,94 @@ func (o *openWebUI) assistantMessage(ctx context.Context, chatID, messageID stri
 		}
 	}
 	return msg, nil
+}
+
+// attachFiles uploads every non-image attachment to Open WebUI's file store
+// and records the reference the chat API wants back.
+func (o *openWebUI) attachFiles(ctx context.Context, turn *Turn) error {
+	for i := range turn.Attachments {
+		att := &turn.Attachments[i]
+		if strings.HasPrefix(att.Mime, "image/") || att.uploaded != nil {
+			continue
+		}
+		var resp struct {
+			ID       string `json:"id"`
+			Filename string `json:"filename"`
+			Meta     struct {
+				Size        int64  `json:"size"`
+				ContentType string `json:"content_type"`
+			} `json:"meta"`
+		}
+		if err := o.multipart(ctx, "/api/v1/files/", *att, nil, &resp); err != nil {
+			return fmt.Errorf("upload %s: %w", att.Name, err)
+		}
+		att.uploaded = map[string]any{
+			"type":         "file",
+			"id":           resp.ID,
+			"name":         resp.Filename,
+			"url":          "/api/v1/files/" + resp.ID,
+			"size":         resp.Meta.Size,
+			"content_type": resp.Meta.ContentType,
+			"status":       "uploaded",
+		}
+	}
+	return nil
+}
+
+// Transcribe sends a voice message through Open WebUI's STT, which converts
+// and forwards it to whatever engine the instance is configured with.
+func (o *openWebUI) Transcribe(ctx context.Context, att Attachment) (string, error) {
+	var resp struct {
+		Text string `json:"text"`
+	}
+	if err := o.multipart(ctx, "/api/v1/audio/transcriptions", att, nil, &resp); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(resp.Text), nil
+}
+
+// multipart posts one file as form field "file".
+func (o *openWebUI) multipart(ctx context.Context, path string, att Attachment, fields map[string]string, out any) error {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	header := textproto.MIMEHeader{}
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, strings.ReplaceAll(att.Name, `"`, "")))
+	header.Set("Content-Type", att.Mime)
+	part, err := writer.CreatePart(header)
+	if err != nil {
+		return err
+	}
+	if _, err := part.Write(att.Data); err != nil {
+		return err
+	}
+	for k, v := range fields {
+		_ = writer.WriteField(k, v)
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(o.cfg.URL, "/")+path, &buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+o.cfg.Key())
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := o.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("open webui POST %s: HTTP %d: %s", path, resp.StatusCode, trim(string(data)))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.Unmarshal(data, out)
 }
 
 func (o *openWebUI) Cancel(ctx context.Context, convID string) error {
