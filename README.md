@@ -177,10 +177,16 @@ reports all five, a plain OpenAI endpoint only the first and last.
 return — it stops the turn with its questions staged on the message, expecting
 a UI to draw a card. The bridge asks each one as a **poll** instead and
 resolves the call with the answers, which resumes the same turn where it
-stopped. An answered poll is ended so the answer cannot be changed to one the
-model never saw; `questions.delete_after_answer: true` removes it from the room
-instead. A question that goes unanswered past `questions.timeout` (10 m by
-default) is reported as unanswered and the model carries on without it.
+stopped.
+
+Once answered, the card is a control that can no longer do anything, so by
+default it is removed and a single line — `question: answer` — is left in its
+place: the record reads in the transcript where a dead card only takes up room.
+`questions.after_answer` picks another ending — `keep` leaves the poll as well
+(ended, so the answer cannot be changed to one the model never saw) and
+`delete` removes it and says nothing. A question that goes unanswered past
+`questions.timeout` (10 m by default) is only ended, never removed: it is the
+record of a question that went nowhere, and the model carries on without it.
 
 A Matrix poll takes one of its options and nothing else, so when the model says
 a free-form answer is acceptable (`allow_other`), **a message typed into the

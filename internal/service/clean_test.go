@@ -78,6 +78,35 @@ func TestWithoutPrefix(t *testing.T) {
 	}
 }
 
+// What an answered question leaves in the room: one line, the answer marked.
+func TestAnswerRecord(t *testing.T) {
+	line := answerRecord(agent.Question{
+		Header:     "Scope",
+		Text:       "What should I do with 'lorem ipsum'?",
+		AllowOther: true,
+	}, "Explain it")
+	if !strings.HasPrefix(line, "Scope — What should I do with 'lorem ipsum'?: ") {
+		t.Errorf("record = %q", line)
+	}
+	// The poll's free-text hint belongs to the control, not to the record.
+	if strings.Contains(line, "type answer") {
+		t.Errorf("the record repeated the poll's hint: %q", line)
+	}
+	if !strings.Contains(line, "Explain it") {
+		t.Errorf("the answer is missing: %q", line)
+	}
+}
+
+// The default is the one that needs no config: the poll goes, the line stays.
+func TestAnswerRecordDefault(t *testing.T) {
+	if got := (config.Questions{}).Record(); got != config.AnswerReplace {
+		t.Errorf("default = %q, want %q", got, config.AnswerReplace)
+	}
+	if got := (config.Questions{AfterAnswer: config.AnswerDelete}).Record(); got != config.AnswerDelete {
+		t.Errorf("configured = %q", got)
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	if got := truncate("short", 10); got != "short" {
 		t.Errorf("truncate(short) = %q", got)

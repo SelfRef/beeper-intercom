@@ -276,33 +276,60 @@ func (s *Service) askOne(ctx context.Context, msg *bridge.Message, room config.R
 	case <-ctx.Done():
 		err = ctx.Err()
 	}
-	s.settlePoll(ctx, msg.RoomID, ghostKey, eventID, err == nil)
+	s.settlePoll(ctx, msg, ghostKey, eventID, question, answer, err == nil)
 	return answer, err
 }
 
-// settlePoll takes an answered question out of play: ended, so the client
-// stops accepting answers that can no longer change anything, or removed
-// entirely when the room would rather not keep it.
-func (s *Service) settlePoll(ctx context.Context, roomID id.RoomID, ghostKey string, poll id.EventID, answered bool) {
-	if answered && s.conf().Questions.DeleteAfterAnswer {
-		if err := s.bridge.Redact(ctx, roomID, ghostKey, poll); err != nil {
+// settlePoll takes a question out of play once it has been dealt with.
+//
+// A poll is a control, and once the answer is in, the control can no longer do
+// anything — but what was asked and what I picked is part of how the
+// conversation went. So an answered question is ended or removed, and the
+// record of it is a line of text, which reads in the transcript where a dead
+// card only takes up room (questions.after_answer). An unanswered one is only
+// ended: it is the record of a question that went nowhere.
+func (s *Service) settlePoll(ctx context.Context, msg *bridge.Message, ghostKey string, poll id.EventID,
+	question agent.Question, answer string, answered bool) {
+	record := s.conf().Questions.Record()
+	if answered && record != config.AnswerKeep {
+		if err := s.bridge.Redact(ctx, msg.RoomID, ghostKey, poll); err != nil {
 			s.log.Debug().Err(err).Msg("Could not remove an answered question")
 		}
-		return
-	}
-	if err := s.bridge.ClosePoll(ctx, roomID, ghostKey, poll); err != nil {
+	} else if err := s.bridge.ClosePoll(ctx, msg.RoomID, ghostKey, poll); err != nil {
 		s.log.Debug().Err(err).Msg("Could not close a question")
+	}
+	if answered && record != config.AnswerDelete {
+		s.notice(ctx, msg.RoomID, ghostKey, msg.ThreadRoot, answerRecord(question, answer))
 	}
 }
 
-// questionText is what the poll asks: the header and the question, and
-// nothing else. The options carry their own descriptions (see askOne), so
-// repeating them here would put the whole card in the title.
-func questionText(question agent.Question) string {
-	text := question.Text
-	if question.Header != "" && !strings.EqualFold(question.Header, question.Text) {
-		text = question.Header + " — " + question.Text
+// answerRecord is the one line an answered question leaves behind: what was
+// asked, and what I picked. The answer is the model's own label, or what I
+// typed when the question took free text.
+func answerRecord(question agent.Question, answer string) string {
+	if answer == "" {
+		answer = "—"
 	}
+	return truncate(askedText(question), recordLimit) + ": " + yes(answer)
+}
+
+// recordLimit keeps that line a line. A model that asks a paragraph-long
+// question gets the start of it back.
+const recordLimit = 200
+
+// askedText is the question itself: the header and the question, and nothing
+// else. The options carry their own descriptions (see askOne), so repeating
+// them here would put the whole card in the title.
+func askedText(question agent.Question) string {
+	if question.Header != "" && !strings.EqualFold(question.Header, question.Text) {
+		return question.Header + " — " + question.Text
+	}
+	return question.Text
+}
+
+// questionText is what the poll asks.
+func questionText(question agent.Question) string {
+	text := askedText(question)
 	if question.AllowOther {
 		// A Matrix poll has no free-text option, so this is the substitute.
 		// It goes on the same line: the question renders as one line whatever

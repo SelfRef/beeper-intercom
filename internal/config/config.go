@@ -531,11 +531,34 @@ type Questions struct {
 	// turn is paused on the backend, not burning anything, and a question
 	// asked while I am away is still worth answering when I come back.
 	Timeout Duration `yaml:"timeout"`
-	// DeleteAfterAnswer removes an answered question from the room. Off by
-	// default: the question and the answer are part of how the conversation
-	// went. Either way the poll is ENDED once answered, so the answer cannot
-	// be changed to one the model never saw.
-	DeleteAfterAnswer bool `yaml:"delete_after_answer"`
+	// AfterAnswer is what the room is left with once a question has been
+	// answered. The poll card is a control, and a control that can no longer
+	// do anything is clutter — but what was asked and what I picked is part of
+	// how the conversation went, so the default trades the card for a line.
+	// An unanswered question is never touched by this: it stays, closed.
+	AfterAnswer AnswerRecord `yaml:"after_answer"`
+}
+
+// AnswerRecord is the three ways an answered question can be tidied away.
+type AnswerRecord string
+
+const (
+	// AnswerReplace removes the poll and posts "what was asked: what I
+	// picked" in its place. The default.
+	AnswerReplace AnswerRecord = "replace"
+	// AnswerKeep leaves the poll (ended, so the answer cannot be changed to
+	// one the model never saw) and posts the line as well.
+	AnswerKeep AnswerRecord = "keep"
+	// AnswerDelete removes the poll and says nothing.
+	AnswerDelete AnswerRecord = "delete"
+)
+
+// Record is AfterAnswer with the default applied.
+func (q Questions) Record() AnswerRecord {
+	if q.AfterAnswer == "" {
+		return AnswerReplace
+	}
+	return q.AfterAnswer
 }
 
 type Log struct {
@@ -752,6 +775,12 @@ func (c *Config) Validate() error {
 	case NoticeSenderBot, NoticeSenderGhost:
 	default:
 		return fmt.Errorf("notices.sender %q must be %s or %s", c.Notices.Sender, NoticeSenderBot, NoticeSenderGhost)
+	}
+	switch c.Questions.Record() {
+	case AnswerReplace, AnswerKeep, AnswerDelete:
+	default:
+		return fmt.Errorf("questions.after_answer %q must be %s, %s or %s",
+			c.Questions.AfterAnswer, AnswerReplace, AnswerKeep, AnswerDelete)
 	}
 	if c.Reasoning.Enabled && len(c.Reasoning.Levels) == 0 {
 		return fmt.Errorf("reasoning.enabled is set but no levels are configured; /think would have nothing to offer")

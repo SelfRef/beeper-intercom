@@ -273,11 +273,15 @@ questions:
   # worth answering when you get back. Unanswered questions are reported as
   # such, and the model carries on without them.
   timeout: 10m
-  # Remove an answered question from the room. Off by default — the question
-  # and the answer are part of how the conversation went. Either way the poll
-  # is ENDED once answered, so the answer cannot be changed to one the model
-  # never saw.
-  delete_after_answer: false
+  # What is left in the room once a question has been answered. The poll card
+  # is a control, and an answered one can no longer do anything — but what was
+  # asked and what I picked is part of how the conversation went.
+  #   replace  remove the poll, leave "question: answer" in its place (default)
+  #   keep     leave the poll as well as that line; it is ENDED either way, so
+  #            the answer cannot be changed to one the model never saw
+  #   delete   remove the poll and say nothing
+  # A question that was never answered is only ever ended, never removed.
+  after_answer: replace
 
 # How hard the model thinks, as a command instead of a model id.
 #
