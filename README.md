@@ -360,6 +360,7 @@ slash:
 | `/retry` | ask the last question again |
 | `/link` | open this conversation in the backend's web UI |
 | `/status` | room, agent, model and reasoning level, last turn's tokens and speed, tools, transport |
+| `/bridge [reload\|restart]` | operate the bridge from the room: `reload` re-reads the config file (rooms reconcile, ghosts refresh, conversations carry on), `restart` replaces the process — it stops the same way the runtime would stop it and whatever supervises it brings it back (`restart: unless-stopped`), then says so in the room that asked |
 | `/clear [all]` · `/clean` | remove the last bridge message, or every one in this conversation |
 | `/help` | the list |
 

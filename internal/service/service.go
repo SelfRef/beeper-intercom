@@ -223,6 +223,8 @@ func (s *Service) connectLoop(ctx context.Context) {
 			cfg := s.conf()
 			s.bridge.Status(ctx, fmt.Sprintf("Bridge up — %s, %d rooms, %d ghosts, %d agents.",
 				s.Version, len(cfg.Rooms), len(cfg.Ghosts), len(cfg.Agents)))
+			// A restart asked for in a room is answered in that room.
+			s.announceRestart(ctx)
 			return
 		}
 		s.log.Error().Err(err).Dur("retry_in", backoff).Msg("Could not bring the bridge up")

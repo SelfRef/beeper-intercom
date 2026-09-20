@@ -44,6 +44,7 @@ var helpText = "**Commands** — everything starting with `/` is handled here an
 		{"`/share`", "publish it as a link anyone can open"},
 		{"`/link`", "open this conversation in the web UI"},
 		{"`/status`", "room, agent, model, context, tools, transport"},
+		{"`/bridge [reload restart]`", "re-read the config file, or restart the bridge itself"},
 		{"`/clear [all]` · `/clean`", "remove the last bridge message, or every one in this conversation"},
 		{"`/help`", "this table"},
 	}) +
@@ -129,6 +130,8 @@ func (s *Service) handleCommand(ctx context.Context, msg *bridge.Message, room c
 		reply = s.commandLink(ctx, msg)
 	case "/status":
 		reply = s.commandStatus(ctx, msg, room)
+	case "/bridge":
+		reply = s.commandBridge(ctx, msg, room, args)
 	case "/clear", "/clean":
 		reply = s.commandClear(ctx, msg, room, args)
 	default:
