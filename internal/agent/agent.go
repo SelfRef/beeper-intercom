@@ -72,10 +72,15 @@ type Reply struct {
 	Link string
 }
 
-// Sink receives progress while a turn runs. Every method is optional.
+// Sink receives progress while a turn runs. Every method is optional; an
+// adapter that streams checks for Delta and falls back to one shot without it.
 type Sink struct {
 	// Status reports a state change: "thinking", "tools", "generating".
 	Status func(state string)
+	// Delta delivers newly generated text, in order. The concatenation of all
+	// deltas is the answer as the model produced it; the Reply returned by Send
+	// is authoritative if the two ever differ.
+	Delta func(text string)
 }
 
 // Agent is one conversational backend.

@@ -33,7 +33,7 @@ func newOpenAI(cfg config.Agent, client *http.Client, st *store.Store, log zerol
 
 func (o *openAI) Type() string { return config.AgentOpenAI }
 
-func (o *openAI) Caps() Caps { return Caps{} }
+func (o *openAI) Caps() Caps { return Caps{Streaming: !o.cfg.NoStream} }
 
 func (o *openAI) Link(string) string { return "" }
 
@@ -72,7 +72,8 @@ func (o *openAI) Send(ctx context.Context, conv Conversation, turn Turn, sink Si
 		sink.Status("thinking")
 	}
 
-	body := map[string]any{"model": model, "messages": messages, "stream": false}
+	stream := sink.Delta != nil && !o.cfg.NoStream
+	body := map[string]any{"model": model, "messages": messages, "stream": stream}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -95,28 +96,20 @@ func (o *openAI) Send(ctx context.Context, conv Conversation, turn Turn, sink Si
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return nil, err
-	}
 	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		return nil, fmt.Errorf("openai endpoint: HTTP %d: %s", resp.StatusCode, trim(string(data)))
 	}
 
-	var parsed struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+	var answer string
+	if stream {
+		answer, err = o.readStream(resp.Body, sink)
+	} else {
+		answer, err = o.readOneShot(resp.Body)
 	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return nil, fmt.Errorf("openai endpoint: bad response: %w", err)
+	if err != nil {
+		return nil, err
 	}
-	if len(parsed.Choices) == 0 {
-		return nil, fmt.Errorf("openai endpoint returned no choices")
-	}
-	answer := parsed.Choices[0].Message.Content
 
 	if err := o.store.AppendTranscript(ctx, conv.ID, "user", turn.Text); err != nil {
 		return nil, err
@@ -125,6 +118,53 @@ func (o *openAI) Send(ctx context.Context, conv Conversation, turn Turn, sink Si
 		return nil, err
 	}
 	return &Reply{Text: answer}, nil
+}
+
+func (o *openAI) readOneShot(body io.Reader) (string, error) {
+	data, err := io.ReadAll(io.LimitReader(body, 8<<20))
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return "", fmt.Errorf("openai endpoint: bad response: %w", err)
+	}
+	if len(parsed.Choices) == 0 {
+		return "", fmt.Errorf("openai endpoint returned no choices")
+	}
+	return parsed.Choices[0].Message.Content, nil
+}
+
+// readStream consumes chat.completion.chunk events, handing each content
+// delta to the sink and returning the whole answer at the end.
+func (o *openAI) readStream(body io.Reader, sink Sink) (string, error) {
+	var answer strings.Builder
+	err := readSSE(body, func(data []byte) error {
+		chunk, err := parseOpenAIChunk(data)
+		if err != nil {
+			return fmt.Errorf("openai endpoint: bad chunk: %w", err)
+		}
+		if chunk.Error != nil {
+			return fmt.Errorf("openai endpoint: %v", chunk.Error)
+		}
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Content != "" {
+				answer.WriteString(choice.Delta.Content)
+				sink.Delta(choice.Delta.Content)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return answer.String(), nil
 }
 
 // Cancel is a no-op: a plain completions endpoint has nothing to cancel

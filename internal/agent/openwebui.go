@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,9 +34,14 @@ import (
 //     the conversation** — the top-level parent_id only decides whether a new
 //     chat is created. With parentId set, the server loads the stored history
 //     and the model sees earlier turns; without it, every turn starts cold;
-//   - stream: false returns the answer in the HTTP body. A streaming request
-//     against a saved chat is turned into a background task and the body is
-//     empty, with the deltas going to socket.io instead.
+//   - stream: false returns the answer in the HTTP body;
+//   - stream: true against a saved chat returns `null` and runs the turn as a
+//     background task. The deltas go to socket.io, but the server also keeps
+//     the partial answer in its response-stream store, and
+//     GET /api/v1/chats/{id} overlays it onto the assistant message with
+//     done: false. Polling that is how this adapter streams: no socket.io
+//     client, no second protocol, and it reads exactly what the web UI would
+//     show on reconnect.
 type openWebUI struct {
 	cfg    config.Agent
 	client *http.Client
@@ -46,6 +52,11 @@ type openWebUI struct {
 	folderErr  error
 }
 
+// pollInterval is how often a streaming turn re-reads the chat. Open WebUI
+// flushes partial output every few deltas, so anything much faster only
+// finds the same text again.
+const pollInterval = 400 * time.Millisecond
+
 func newOpenWebUI(cfg config.Agent, client *http.Client, log zerolog.Logger) *openWebUI {
 	return &openWebUI{cfg: cfg, client: client, log: log}
 }
@@ -53,7 +64,7 @@ func newOpenWebUI(cfg config.Agent, client *http.Client, log zerolog.Logger) *op
 func (o *openWebUI) Type() string { return config.AgentOpenWebUI }
 
 func (o *openWebUI) Caps() Caps {
-	return Caps{ServerHistory: true, Cancel: true, DeepLink: true}
+	return Caps{ServerHistory: true, Streaming: !o.cfg.NoStream, Cancel: true, DeepLink: true}
 }
 
 func (o *openWebUI) Link(convID string) string {
@@ -98,16 +109,15 @@ func (o *openWebUI) NewConversation(ctx context.Context, seed *Seed) (string, er
 	return resp.ID, nil
 }
 
-func (o *openWebUI) Send(ctx context.Context, conv Conversation, turn Turn, sink Sink) (*Reply, error) {
+// turnRequest builds the completions body. Streaming and one-shot differ in
+// exactly one field.
+func (o *openWebUI) turnRequest(conv Conversation, turn Turn, assistantID string, stream bool) map[string]any {
 	model := conv.Model
 	if model == "" {
 		model = o.cfg.Model
 	}
-	userID := uuid.NewString()
-	assistantID := uuid.NewString()
-
 	userMessage := map[string]any{
-		"id":        userID,
+		"id":        uuid.NewString(),
 		"role":      "user",
 		"content":   turn.Text,
 		"timestamp": time.Now().Unix(),
@@ -118,12 +128,11 @@ func (o *openWebUI) Send(ctx context.Context, conv Conversation, turn Turn, sink
 	if conv.Parent != "" {
 		userMessage["parentId"] = conv.Parent
 	}
-
 	body := map[string]any{
 		"model":        model,
 		"chat_id":      conv.ID,
 		"id":           assistantID,
-		"stream":       false,
+		"stream":       stream,
 		"messages":     []map[string]any{{"role": "user", "content": turn.Text}},
 		"user_message": userMessage,
 		"background_tasks": map[string]any{
@@ -145,11 +154,21 @@ func (o *openWebUI) Send(ctx context.Context, conv Conversation, turn Turn, sink
 	if len(o.cfg.ToolServers) > 0 {
 		body["tool_servers"] = o.cfg.ToolServers
 	}
+	return body
+}
 
+func (o *openWebUI) Send(ctx context.Context, conv Conversation, turn Turn, sink Sink) (*Reply, error) {
+	if sink.Delta != nil && !o.cfg.NoStream {
+		return o.sendStreaming(ctx, conv, turn, sink)
+	}
+	return o.sendOneShot(ctx, conv, turn, sink)
+}
+
+func (o *openWebUI) sendOneShot(ctx context.Context, conv Conversation, turn Turn, sink Sink) (*Reply, error) {
+	assistantID := uuid.NewString()
 	if sink.Status != nil {
 		sink.Status("thinking")
 	}
-
 	var resp struct {
 		Choices []struct {
 			Message struct {
@@ -159,7 +178,7 @@ func (o *openWebUI) Send(ctx context.Context, conv Conversation, turn Turn, sink
 		} `json:"choices"`
 		Error any `json:"error"`
 	}
-	if err := o.do(ctx, http.MethodPost, "/api/chat/completions", body, &resp); err != nil {
+	if err := o.do(ctx, http.MethodPost, "/api/chat/completions", o.turnRequest(conv, turn, assistantID, false), &resp); err != nil {
 		return nil, err
 	}
 	if resp.Error != nil {
@@ -178,6 +197,128 @@ func (o *openWebUI) Send(ctx context.Context, conv Conversation, turn Turn, sink
 			resp.Choices[0].Message.ReasoningContent
 	}
 	return &Reply{Text: text, Parent: assistantID, Link: o.Link(conv.ID)}, nil
+}
+
+// sendStreaming runs the turn as Open WebUI's background task and polls the
+// chat for the growing answer. The HTTP request itself blocks until the task
+// is done and returns nothing useful, so it runs in the background and only
+// its error matters.
+func (o *openWebUI) sendStreaming(ctx context.Context, conv Conversation, turn Turn, sink Sink) (*Reply, error) {
+	assistantID := uuid.NewString()
+	if sink.Status != nil {
+		sink.Status("thinking")
+	}
+
+	requestDone := make(chan error, 1)
+	go func() {
+		requestDone <- o.do(ctx, http.MethodPost, "/api/chat/completions", o.turnRequest(conv, turn, assistantID, true), nil)
+	}()
+
+	var acc accumulator
+	var lastVisible, rawContent string
+	// Once the request has returned, the task is over, but the last flush and
+	// the done flag can lag behind it by a moment. A few more polls catch
+	// them; after that whatever is there is the answer.
+	const gracePolls = 10
+	graceLeft := -1
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case err := <-requestDone:
+			if err != nil {
+				return nil, err
+			}
+			requestDone = nil
+			graceLeft = gracePolls
+		case <-ticker.C:
+		}
+
+		msg, err := o.assistantMessage(ctx, conv.ID, assistantID)
+		if err != nil {
+			// A transient read failure should not kill the turn; the next tick
+			// tries again, unless the grace period is over.
+			o.log.Debug().Err(err).Msg("Poll failed")
+			if graceLeft == 0 {
+				return nil, err
+			}
+		} else if msg != nil {
+			if msg.Error != "" {
+				return nil, fmt.Errorf("open webui: %s", msg.Error)
+			}
+			rawContent = msg.Content
+			visible := StripDetails(msg.Content)
+			if delta, ok := acc.delta(visible); ok {
+				if sink.Status != nil && lastVisible == "" {
+					sink.Status("generating")
+				}
+				sink.Delta(delta)
+			}
+			lastVisible = visible
+			if msg.Done {
+				break
+			}
+		}
+		if graceLeft == 0 {
+			break
+		}
+		if graceLeft > 0 {
+			graceLeft--
+		}
+	}
+
+	text := lastVisible
+	if text == "" && strings.Contains(rawContent, "<details") {
+		// The whole answer was a reasoning block. Say so rather than sending
+		// an empty bubble.
+		text = "*No answer — the model returned only its reasoning.*"
+	}
+	return &Reply{Text: text, Parent: assistantID, Link: o.Link(conv.ID)}, nil
+}
+
+// chatMessage is the slice of a stored message the streaming loop reads.
+type chatMessage struct {
+	Content string
+	Done    bool
+	Error   string
+}
+
+// assistantMessage reads one message out of the chat, with the live
+// response-stream overlay the server applies to GET /api/v1/chats/{id}.
+func (o *openWebUI) assistantMessage(ctx context.Context, chatID, messageID string) (*chatMessage, error) {
+	var resp struct {
+		Chat struct {
+			History struct {
+				Messages map[string]struct {
+					Content string          `json:"content"`
+					Done    bool            `json:"done"`
+					Error   json.RawMessage `json:"error"`
+				} `json:"messages"`
+			} `json:"history"`
+		} `json:"chat"`
+	}
+	if err := o.do(ctx, http.MethodGet, "/api/v1/chats/"+chatID, nil, &resp); err != nil {
+		return nil, err
+	}
+	raw, ok := resp.Chat.History.Messages[messageID]
+	if !ok {
+		return nil, nil
+	}
+	msg := &chatMessage{Content: raw.Content, Done: raw.Done}
+	if len(raw.Error) > 0 && string(raw.Error) != "null" {
+		var structured struct {
+			Content string `json:"content"`
+		}
+		if json.Unmarshal(raw.Error, &structured) == nil && structured.Content != "" {
+			msg.Error = structured.Content
+		} else {
+			msg.Error = trim(string(raw.Error))
+		}
+	}
+	return msg, nil
 }
 
 func (o *openWebUI) Cancel(ctx context.Context, convID string) error {
@@ -255,6 +396,9 @@ func (o *openWebUI) do(ctx context.Context, method, path string, body, out any) 
 	}
 	if out == nil {
 		return nil
+	}
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return errors.New("open webui returned null")
 	}
 	if err := json.Unmarshal(data, out); err != nil {
 		return fmt.Errorf("open webui %s %s: bad response: %w", method, path, err)

@@ -24,6 +24,10 @@ import (
 //	                      generates one)
 //	POST <url>/turn    {"conv_id": "...", "text": "...", "internal": false}
 //	                   -> {"text": "...", "link": "..."}
+//	                   or, to stream, a text/event-stream response of
+//	                      data: {"delta": "..."}   (any number)
+//	                      data: {"text": "...", "link": "..."}  (optional final)
+//	                      data: [DONE]
 //	POST <url>/cancel  {"conv_id": "..."} -> anything
 //
 // A 404 on /new or /cancel is not an error: those are optional.
@@ -39,7 +43,7 @@ func newWebhook(cfg config.Agent, client *http.Client, log zerolog.Logger) *webh
 
 func (w *webhook) Type() string { return config.AgentWebhook }
 
-func (w *webhook) Caps() Caps { return Caps{Cancel: true} }
+func (w *webhook) Caps() Caps { return Caps{Streaming: !w.cfg.NoStream, Cancel: true} }
 
 func (w *webhook) Link(string) string { return "" }
 
@@ -63,27 +67,81 @@ func (w *webhook) NewConversation(ctx context.Context, seed *Seed) (string, erro
 	return resp.ConvID, nil
 }
 
+// turnReply is the JSON shape of a finished turn, whether it arrived as one
+// body or as the last event of a stream.
+type turnReply struct {
+	Text  string `json:"text"`
+	Link  string `json:"link"`
+	Delta string `json:"delta"`
+}
+
 func (w *webhook) Send(ctx context.Context, conv Conversation, turn Turn, sink Sink) (*Reply, error) {
 	if sink.Status != nil {
 		sink.Status("thinking")
-	}
-	var resp struct {
-		Text string `json:"text"`
-		Link string `json:"link"`
 	}
 	body := map[string]any{
 		"conv_id":  conv.ID,
 		"text":     turn.Text,
 		"internal": turn.Internal,
 		"turns":    conv.Turns,
+		// Tells the sidecar it may stream; one that cannot just answers JSON.
+		"stream": sink.Delta != nil && !w.cfg.NoStream,
 	}
-	if err := w.do(ctx, "/turn", body, &resp); err != nil {
+	resp, err := w.post(ctx, "/turn", body)
+	if err != nil {
 		return nil, err
 	}
-	if resp.Text == "" {
+	defer resp.Body.Close()
+
+	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		return w.readStream(resp.Body, sink)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, err
+	}
+	var reply turnReply
+	if err := json.Unmarshal(data, &reply); err != nil {
+		return nil, fmt.Errorf("webhook agent /turn: bad response: %w", err)
+	}
+	if reply.Text == "" {
 		return nil, fmt.Errorf("webhook agent returned an empty answer")
 	}
-	return &Reply{Text: resp.Text, Link: resp.Link}, nil
+	return &Reply{Text: reply.Text, Link: reply.Link}, nil
+}
+
+// readStream accepts deltas and an optional final message. If the sidecar
+// sends no final text, the deltas concatenated are the answer.
+func (w *webhook) readStream(body io.Reader, sink Sink) (*Reply, error) {
+	var answer strings.Builder
+	var final turnReply
+	err := readSSE(body, func(data []byte) error {
+		var evt turnReply
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return fmt.Errorf("webhook agent stream: bad event: %w", err)
+		}
+		if evt.Delta != "" {
+			answer.WriteString(evt.Delta)
+			if sink.Delta != nil {
+				sink.Delta(evt.Delta)
+			}
+		}
+		if evt.Text != "" || evt.Link != "" {
+			final = evt
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	text := final.Text
+	if text == "" {
+		text = answer.String()
+	}
+	if text == "" {
+		return nil, fmt.Errorf("webhook agent returned an empty answer")
+	}
+	return &Reply{Text: text, Link: final.Link}, nil
 }
 
 func (w *webhook) Cancel(ctx context.Context, convID string) error {
@@ -94,16 +152,17 @@ func (w *webhook) Cancel(ctx context.Context, convID string) error {
 	return err
 }
 
-func (w *webhook) do(ctx context.Context, path string, body, out any) error {
+func (w *webhook) post(ctx context.Context, path string, body any) (*http.Response, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(w.cfg.URL, "/")+path, bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
 	if key := w.cfg.Key(); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
@@ -112,18 +171,29 @@ func (w *webhook) do(ctx context.Context, path string, body, out any) error {
 	}
 	resp, err := w.client.Do(req)
 	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil, errNotFound
+	}
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		resp.Body.Close()
+		return nil, fmt.Errorf("webhook agent %s: HTTP %d: %s", path, resp.StatusCode, trim(string(data)))
+	}
+	return resp, nil
+}
+
+func (w *webhook) do(ctx context.Context, path string, body, out any) error {
+	resp, err := w.post(ctx, path, body)
+	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return err
-	}
-	if resp.StatusCode == http.StatusNotFound {
-		return errNotFound
-	}
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("webhook agent %s: HTTP %d: %s", path, resp.StatusCode, trim(string(data)))
 	}
 	if out == nil {
 		return nil

@@ -24,6 +24,7 @@ import (
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
+	"maunium.net/go/mautrix/beeperstream"
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -97,6 +98,7 @@ type Bridge struct {
 	handlers Handlers
 
 	as     *appservice.AppService
+	ep     *appservice.EventProcessor
 	reg    *appservice.Registration
 	userID id.UserID
 	// user is a client authenticated as the account owner, needed for the
@@ -113,6 +115,8 @@ type Bridge struct {
 
 	connected  bool
 	lastConnet time.Time
+
+	streams streamer
 }
 
 // New prepares a bridge. Nothing talks to the network until Start.
@@ -124,6 +128,7 @@ func New(cfg *config.Config, st *store.Store, log zerolog.Logger, handlers Handl
 		roomIDs:  map[string]id.RoomID{},
 		roomKey:  map[id.RoomID]string{},
 		ghosts:   map[string]id.UserID{},
+		streams:  streamer{helpers: map[string]*beeperstream.Helper{}},
 	}
 	b.cfg.Store(cfg)
 	return b
@@ -167,6 +172,7 @@ func (b *Bridge) Start(ctx context.Context) error {
 	}
 
 	ep := appservice.NewEventProcessor(as)
+	b.ep = ep
 	ep.On(event.EventMessage, b.handleMessage)
 	ep.On(event.EventReaction, b.handleReaction)
 	ep.On(event.EventRedaction, b.handleRedaction)

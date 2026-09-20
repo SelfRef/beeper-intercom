@@ -158,6 +158,10 @@ type Agent struct {
 	// webhook: extra headers for the sidecar, e.g. a shared secret.
 	Headers map[string]string `yaml:"headers"`
 
+	// NoStream turns off live streaming for this agent: the answer arrives
+	// as one message when it is complete. Streaming is on by default.
+	NoStream bool `yaml:"no_stream"`
+
 	Timeout Duration `yaml:"timeout"`
 	Session Session  `yaml:"session"`
 }

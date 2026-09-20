@@ -89,6 +89,10 @@ agents:
     model: my-model
     # Created if missing; keeps bridge chats out of the main sidebar.
     folder: Intercom
+    # Answers stream into the bubble token by token (com.beeper.stream) and
+    # are committed as an edit when complete. Set to true for one message per
+    # answer instead.
+    no_stream: false
     session:
       # A new topic after a long gap should not inherit stale context.
       idle_minutes: 120

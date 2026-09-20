@@ -143,11 +143,19 @@ Publishers move to `/v1/notify` only when they want threads, actions or media
 ## Talking to an agent
 
 A room with an `agent:` is conversational. Type in it and the agent answers:
-typing indicator while it works, a ⚙️ reaction on your message while it runs,
-Markdown rendered into the Matrix HTML subset, long answers split at paragraph
+typing indicator while it thinks, a ⚙️ reaction on your message while it runs,
+**the answer streamed live into the bubble** as it is generated, Markdown
+rendered into the Matrix HTML subset, long answers split at paragraph
 boundaries and also attached as a `.md` file. A failure marks **your** message
 as failed (`com.beeper.message_send_status`) instead of adding an apology to
 the conversation.
+
+Streaming uses Beeper's `com.beeper.stream`: the first token opens a message
+carrying a stream descriptor, later tokens go to your devices as to-device
+updates, and the finished answer is committed as an edit — the copy every
+other device and every reload sees. Clients without stream support show `…`
+until that edit lands. Set `no_stream: true` on an agent to get one message
+per answer instead.
 
 Commands, handled before anything reaches the backend:
 
@@ -169,17 +177,20 @@ and the new one starts from that summary.
 
 | Type | For | History |
 | --- | --- | --- |
-| `openwebui` | Open WebUI: its tools, memory, RAG and compaction | server-side, one chat per conversation, visible and continuable in the web UI |
-| `openai` | anything speaking `/v1/chat/completions` | the bridge keeps a transcript and replays a rolling window |
-| `webhook` | a sidecar in any language | whatever the sidecar wants |
+| `openwebui` | Open WebUI: its tools, memory, RAG and compaction | server-side, one chat per conversation, visible and continuable in the web UI; streams by polling the chat while the turn runs as a background task |
+| `openai` | anything speaking `/v1/chat/completions` | the bridge keeps a transcript and replays a rolling window; streams over SSE |
+| `webhook` | a sidecar in any language | whatever the sidecar wants; streams if it answers with `text/event-stream` |
 
 **The webhook contract**, so you can write your own:
 
 ```
 POST <url>/new     {"seed": {"kind": "notification"|"summary", "text": "…", "room": "…"}}
                    → {"conv_id": "…"}          (optional endpoint; 404 is fine)
-POST <url>/turn    {"conv_id": "…", "text": "…", "internal": false, "turns": 3}
+POST <url>/turn    {"conv_id": "…", "text": "…", "internal": false, "turns": 3, "stream": true}
                    → {"text": "…", "link": "…"}
+                   or a text/event-stream of  data: {"delta": "…"}  events,
+                   optionally ending with     data: {"text": "…", "link": "…"}
+                   and                        data: [DONE]
 POST <url>/cancel  {"conv_id": "…"}            (optional endpoint; 404 is fine)
 ```
 

@@ -108,9 +108,48 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 		}
 	}()
 
+	// Streaming: the first delta opens a live bubble (com.beeper.stream) and
+	// every later one feeds it; the finished answer is committed as an edit.
+	// If the anchor cannot be sent, deltas are dropped and the answer arrives
+	// the old way — streaming is comfort, not correctness.
+	answerOpts := bridge.SendOptions{ThreadRoot: msg.ThreadRoot}
+	if answerOpts.ThreadRoot != "" {
+		answerOpts.ReplyTo = msg.EventID
+	}
+	var stream *bridge.Stream
+	var streamMu sync.Mutex
+	streamFailed := false
+	sink := agent.Sink{}
+	if backend.Caps().Streaming {
+		sink.Delta = func(text string) {
+			streamMu.Lock()
+			defer streamMu.Unlock()
+			if stream == nil {
+				if streamFailed {
+					return
+				}
+				opened, err := s.bridge.StartStream(ctx, roomID, ghostKey, answerOpts)
+				if err != nil {
+					streamFailed = true
+					s.log.Warn().Err(err).Msg("Could not open a stream; falling back to one message")
+					return
+				}
+				stream = opened
+				stopTyping()
+			}
+			stream.Push(text)
+		}
+	}
+
 	conv := agent.Conversation{ID: sess.ConvID, Parent: parent, Model: sess.Model, Turns: sess.Turns}
-	reply, err := backend.Send(turnCtx, conv, agent.Turn{Text: msg.Body}, agent.Sink{})
+	reply, err := backend.Send(turnCtx, conv, agent.Turn{Text: msg.Body}, sink)
+	streamMu.Lock()
+	opened := stream
+	streamMu.Unlock()
 	if err != nil {
+		if opened != nil {
+			opened.Abort(ctx)
+		}
 		if turnCtx.Err() != nil {
 			// Cancelled on purpose (a redaction, or a newer message): say
 			// nothing, the user already knows.
@@ -121,7 +160,7 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 	}
 	stopTyping()
 
-	replyEvent, err := s.postAnswer(ctx, msg, ghostKey, reply.Text)
+	replyEvent, err := s.postAnswer(ctx, msg, ghostKey, reply.Text, opened, answerOpts)
 	if err != nil {
 		s.reportFailure(ctx, msg, err)
 		return
@@ -145,22 +184,27 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 
 // postAnswer renders and sends the answer, splitting it at paragraph
 // boundaries and attaching anything that is too long to read in a bubble.
-func (s *Service) postAnswer(ctx context.Context, msg *bridge.Message, ghostKey, text string) (id.EventID, error) {
+// With a live stream, the first part becomes the stream's final edit — the
+// durable copy of what was streamed — and only the overflow is new messages.
+func (s *Service) postAnswer(ctx context.Context, msg *bridge.Message, ghostKey, text string, stream *bridge.Stream, opts bridge.SendOptions) (id.EventID, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		text = "_(the agent returned an empty answer)_"
-	}
-	opts := bridge.SendOptions{ThreadRoot: msg.ThreadRoot}
-	if opts.ThreadRoot != "" {
-		opts.ReplyTo = msg.EventID
 	}
 
 	limit := s.conf().Limits.MessageSplitBytes
 	parts := bridge.SplitMessage(text, limit)
 
 	var first id.EventID
-	for _, part := range parts {
+	for i, part := range parts {
 		plain, formatted := bridge.Markdown(part)
+		if i == 0 && stream != nil {
+			if err := stream.Finish(ctx, plain, formatted); err != nil {
+				return "", err
+			}
+			first = stream.EventID
+			continue
+		}
 		sent, err := s.bridge.SendText(ctx, msg.RoomID, ghostKey, plain, formatted, opts)
 		if err != nil {
 			return first, err
