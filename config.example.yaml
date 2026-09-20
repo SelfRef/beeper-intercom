@@ -1,0 +1,159 @@
+# beeper-intercom — example configuration.
+#
+# Copy this next to your deployment, change the names, and mount it read-only
+# at /config/config.yaml. Secrets never belong in here: a field that needs one
+# names an environment variable instead, and ${VAR} is expanded anywhere in
+# this file at load time.
+#
+# `beeper-intercom -check -config config.yaml` validates the file without
+# talking to anything.
+
+network:
+  # The bbctl registration name. Beeper requires the sh- prefix; this is also
+  # the prefix of every ghost's MXID (@sh-example_updates:beeper.local).
+  bridge: sh-example
+  # The m.bridge protocol id — what groups these rooms into one network in the
+  # client, next to Telegram and Signal.
+  id: intercom
+  # What the client shows as the network name.
+  name: Intercom
+  # Uploaded once and cached; the path is relative to this file.
+  avatar: avatars/intercom.png
+
+matrix:
+  # api.<domain> and matrix.<domain>. Only change this for a non-production
+  # Beeper deployment.
+  base_domain: beeper.com
+  # The environment variable holding the Beeper account token. The same token
+  # bbctl uses; it registers the appservice and writes room tags and mute.
+  token_env: MATRIX_ACCESS_TOKEN
+
+server:
+  bind: 0.0.0.0:8080
+  # Two roles. The ingest token ends up in scripts and workflows and can only
+  # post; the admin token reads stored notifications and rewrites state.
+  ingest_token_env: INTERCOM_INGEST_TOKEN
+  admin_token_env: INTERCOM_ADMIN_TOKEN
+
+# Ghosts are real room members with a profile — not per-message rendering
+# hints. The key becomes the MXID localpart, so it must be [a-z0-9_-].
+ghosts:
+  updates:
+    name: Updates
+    avatar: avatars/updates.png
+  alerts:
+    name: Alerts
+    avatar: avatars/alerts.png
+  agent:
+    name: Intercom
+    avatar: avatars/agent.png
+
+# Rooms are reconciled on every start: created if missing, patched if the
+# config drifted, never deleted. Renaming a room in config renames the room —
+# the key is its identity, not its name.
+rooms:
+  news:
+    name: Intercom — News
+    topic: Routine announcements from the stack.
+    # broadcast: the composer is locked (events_default is above your power
+    # level) but reactions stay open at power level 0, because reacting is how
+    # you acknowledge something you cannot reply to.
+    kind: broadcast
+    ghosts: [updates]
+    tags: [lowpriority]
+
+  alerts:
+    name: Intercom — Alerts
+    topic: Things that want attention now.
+    kind: broadcast
+    ghosts: [alerts]
+    # priority high/urgent becomes an @room mention in this room only.
+    urgent_mentions: true
+
+  chat:
+    name: Intercom
+    topic: Talk to the agent.
+    # dm renders as a direct message, which needs exactly one ghost.
+    kind: dm
+    ghosts: [agent]
+    agent: main
+
+# Agents are adapters. openwebui is one backend, not a dependency: openai
+# covers anything speaking /v1/chat/completions, and webhook is a documented
+# contract any sidecar can implement (see the README).
+agents:
+  main:
+    type: openwebui
+    url: http://openwebui:8080
+    api_key_env: OWUI_API_KEY
+    model: my-model
+    # Created if missing; keeps bridge chats out of the main sidebar.
+    folder: Intercom
+    session:
+      # A new topic after a long gap should not inherit stale context.
+      idle_minutes: 120
+      # Hard ceiling. Compaction inside the backend has been handling growth
+      # long before this.
+      max_turns: 40
+      # Ask the outgoing conversation to summarise itself and seed the new one
+      # with it. Costs one extra turn per rotation.
+      carry_summary: true
+
+  # Universal fallback: the bridge keeps the transcript itself.
+  # raw:
+  #   type: openai
+  #   url: http://llama-swap:8080/v1
+  #   model: main
+  #   max_history: 20
+  #   system_prompt: You are a terse assistant answering from a chat app.
+
+  # External adapter protocol: POST /new, /turn, /cancel.
+  # media:
+  #   type: webhook
+  #   url: http://n8n:5678/webhook/intercom-media
+
+# Sources are inbound adapters. Every one of them produces the same internal
+# notification, so rooms, dedupe, threads and actions never learn where a
+# message came from.
+sources:
+  # The native POST /v1/notify API. Always available; listed for symmetry.
+  - type: notify
+
+  # Mirror ntfy topics into rooms. Nothing on the publishing side changes:
+  # existing scripts keep posting to ntfy, and ntfy keeps working for the
+  # alarms that must arrive when this bridge is down.
+  - type: ntfy
+    url: http://ntfy
+    topics:
+      example-updates:
+        room: news
+        ghost: updates
+      example-alerts:
+        room: alerts
+        ghost: alerts
+        # Drop anything below ntfy priority 3 instead of mirroring it.
+        min_priority: 3
+
+# Where reactions and poll answers are reported. The receiver decides what an
+# action means; the bridge only knows that one was declared.
+actions:
+  webhook: http://n8n:5678/webhook/intercom-action
+  timeout: 15s
+  max_attempts: 8
+  # Report reactions no notification declared, with a null action name, so new
+  # conventions can be invented on the receiving side without a redeploy.
+  report_undeclared: true
+
+log:
+  level: info
+  format: json
+
+limits:
+  # How many announcements may queue before callers are told to back off.
+  queue_size: 512
+  notify_retention_days: 30
+  delivery_retention_days: 14
+  max_media_bytes: 67108864
+  # Longer answers are split at paragraph boundaries and also attached as a
+  # .md file.
+  message_split_bytes: 16384

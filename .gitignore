@@ -1,0 +1,13 @@
+# Build output
+/beeper-intercom
+/out/
+
+# Local state: the service keeps everything in one SQLite file, which is a
+# volume in production and litter here.
+*.db
+*.db-wal
+*.db-shm
+/data/
+
+# A local config with real hostnames and room names is not the example.
+/config.yaml

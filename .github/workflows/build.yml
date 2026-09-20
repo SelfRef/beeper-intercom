@@ -1,0 +1,202 @@
+name: Build image
+
+# Builds ghcr.io/selfref/beeper-intercom:latest — the bridge that turns a
+# self-hosted stack into one more chat network inside Beeper (see README.md).
+#
+# The unit tests run on the host toolchain because they are fast and need
+# nothing; the image is then smoke-tested as it will actually run, because the
+# failures that matter here are startup failures: a config that does not load,
+# a surface that is not served, an auth check that is not applied.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Weekly, Monday. The base images pick up security updates between
+    # releases and nothing here pins them by digest.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed for: $unformatted"
+            exit 1
+          fi
+
+      - name: Test
+        run: go test -race ./...
+
+      # The example config is documentation people copy; a broken one is a
+      # broken first five minutes.
+      - name: Validate the example config
+        run: go run ./cmd/beeper-intercom -check -config config.example.yaml
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint Dockerfile
+        run: docker build --check .
+
+      # GHCR requires lowercase names; github.repository may contain uppercase.
+      - name: Set image name
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # :latest is the only published tag. :pr-<n> exists so pull-request
+      # builds have a name for the tests below to run against; they never push.
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=beeper-intercom
+            org.opencontainers.image.description=Announcements and an agent, as a self-hosted Beeper network
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          build-args: |
+            VERSION=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          IMG="$(echo "$TAGS" | head -n1)"
+
+          # A config that loads is the first thing that can go wrong, and the
+          # binary can say so without any network at all.
+          docker run --rm -v "$PWD/config.example.yaml:/config/config.yaml:ro" "$IMG" \
+            -check | grep -q ' ok ' || { echo "::error::config check failed"; exit 1; }
+
+          # Now the real thing, minus Beeper: no account token, so registration
+          # fails and the process exits. That is the contract — it must fail
+          # loudly rather than sit there looking healthy.
+          out=$(docker run --rm -v "$PWD/config.example.yaml:/config/config.yaml:ro" \
+            -v "$(mktemp -d):/data" "$IMG" 2>&1 || true)
+          echo "$out" | grep -q 'no Beeper account token' \
+            || { echo "::error::expected a clear error without a token, got: $out"; exit 1; }
+
+          # The HTTP surfaces are served before Beeper is reachable, because
+          # that is how you debug a bridge that cannot connect. Point the
+          # bridge at an unroutable Beeper so startup stalls in the websocket
+          # loop rather than exiting.
+          cat > /tmp/smoke.yaml <<'YAML'
+          network: { bridge: sh-smoke, name: Smoke }
+          matrix: { base_domain: invalid.localhost, token_env: SMOKE_TOKEN }
+          server: { ingest_token_env: SMOKE_INGEST, admin_token_env: SMOKE_ADMIN }
+          ghosts: { bot: { name: Bot } }
+          rooms: { news: { name: News, kind: broadcast, ghosts: [bot] } }
+          YAML
+          docker run -d --name intercom -p 8080:8080 \
+            -v /tmp/smoke.yaml:/config/config.yaml:ro \
+            -e SMOKE_TOKEN=token -e SMOKE_INGEST=ingest -e SMOKE_ADMIN=admin \
+            "$IMG" >/dev/null
+
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/health | grep -q '"status":"ok"' \
+            || { echo "::error::health check failed"; docker logs intercom; exit 1; }
+
+          # The ingest token must not open the admin API: it ends up in
+          # scripts and workflows, and a leak there must not be a leak of
+          # everything.
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/v1/rooms)
+          [ "$code" = "401" ] || { echo "::error::admin API is not protected (got $code)"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ingest' \
+            http://127.0.0.1:8080/v1/rooms)
+          [ "$code" = "401" ] || { echo "::error::ingest token reaches the admin API (got $code)"; exit 1; }
+          curl -fsS -H 'Authorization: Bearer admin' http://127.0.0.1:8080/v1/rooms | grep -q '"key":"news"' \
+            || { echo "::error::admin API did not list the configured room"; exit 1; }
+
+          # A malformed notification is a caller error, not a 500.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/notify \
+            -H 'Authorization: Bearer ingest' -H 'Content-Type: application/json' \
+            -d '{"room":"nope","text":"x"}')
+          [ "$code" = "400" ] || { echo "::error::unknown room was not rejected (got $code)"; exit 1; }
+
+          # The MCP endpoint is a mounted handler and the easiest thing to
+          # break without noticing.
+          mcp=$(curl -fsS -X POST http://127.0.0.1:8080/mcp \
+            -H 'Authorization: Bearer admin' -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}')
+          echo "$mcp" | grep -q 'beeper-intercom' \
+            || { echo "::error::MCP endpoint did not initialise: $mcp"; docker logs intercom; exit 1; }
+
+          tools=$(curl -fsS -X POST http://127.0.0.1:8080/mcp \
+            -H 'Authorization: Bearer admin' -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}')
+          echo "$tools" | grep -q 'send_notification' \
+            || { echo "::error::MCP endpoint did not list tools: $tools"; exit 1; }
+
+          echo "smoke OK"
+          docker rm -f intercom >/dev/null
+
+      - name: Push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
