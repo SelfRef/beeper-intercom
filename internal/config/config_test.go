@@ -280,15 +280,15 @@ func TestReasoningValidation(t *testing.T) {
 		return minimal + "\nreasoning:\n  enabled: true\n  levels:\n" + body
 	}
 	for name, body := range map[string]string{
-		"no levels":        minimal + "\nreasoning:\n  enabled: true\n",
-		"no suffix":        levels("    - { name: High, ids: [high] }\n"),
-		"no ids":           levels("    - { name: High, suffix: \":x\" }\n"),
-		"no name":          levels("    - { ids: [high], suffix: \":x\" }\n"),
-		"off is reserved":  levels("    - { name: Off, ids: [off], suffix: \":o\" }\n"),
+		"no levels":            minimal + "\nreasoning:\n  enabled: true\n",
+		"no suffix":            levels("    - { name: High, ids: [high] }\n"),
+		"no ids":               levels("    - { name: High, suffix: \":x\" }\n"),
+		"no name":              levels("    - { ids: [high], suffix: \":x\" }\n"),
+		"off is reserved":      levels("    - { name: Off, ids: [off], suffix: \":o\" }\n"),
 		"suffix is off_suffix": minimal + "\nreasoning:\n  enabled: true\n  off_suffix: \":nt\"\n  levels:\n    - { name: No think, ids: [nope], suffix: \":nt\" }\n",
-		"duplicate id":     levels("    - { name: High, ids: [h], suffix: \":x\" }\n    - { name: Huge, ids: [h], suffix: \":h\" }\n"),
-		"duplicate suffix": levels("    - { name: High, ids: [high], suffix: \":x\" }\n    - { name: Extra, ids: [extra], suffix: \":x\" }\n"),
-		"bad id":           levels("    - { name: High, ids: [\"Very High\"], suffix: \":x\" }\n"),
+		"duplicate id":         levels("    - { name: High, ids: [h], suffix: \":x\" }\n    - { name: Huge, ids: [h], suffix: \":h\" }\n"),
+		"duplicate suffix":     levels("    - { name: High, ids: [high], suffix: \":x\" }\n    - { name: Extra, ids: [extra], suffix: \":x\" }\n"),
+		"bad id":               levels("    - { name: High, ids: [\"Very High\"], suffix: \":x\" }\n"),
 	} {
 		if _, err := load(t, body); err == nil {
 			t.Errorf("%s: expected an error", name)
