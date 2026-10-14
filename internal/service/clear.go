@@ -22,9 +22,13 @@ import (
 //
 //   - /clear (or its older name /clean), which takes the last one — or all of
 //     them, in this conversation;
-//   - the delete button: a reaction the bot puts on the command I typed.
-//     Tapping it sends the same reaction from me, and that is the press;
+//   - the delete button (notices.commands: button): a reaction the bot puts
+//     on the command I typed. Tapping it sends the same reaction from me, and
+//     that is the press;
 //   - deleting the command message myself, which takes its answer with it.
+//
+// notices.commands: delete is the opposite trade: the command goes as soon as
+// it is answered, and the answer stays.
 //
 // All three rely on the redaction path hiding the tombstone (bridge/send.go),
 // so a cleared message leaves nothing at all behind.
@@ -118,21 +122,34 @@ func (s *Service) commandsToClear(ctx context.Context, msg *bridge.Message, noti
 	return out, nil
 }
 
-// addClearButton puts the delete button on a command I have just typed.
+// settleCommand tidies a command I have just typed, once it has been
+// answered: notices.commands says whether it stays, gets the delete button, or
+// goes.
 //
 // A bridge message cannot be reacted to at all, so there is no way to offer an
 // action ON the answer. A reaction the bot has already placed on MY message
 // can be tapped though, and tapping it sends the same reaction from me — which
 // is exactly the signal clearForCommand is waiting for. The bot places the
 // button; my tap is the press.
-func (s *Service) addClearButton(ctx context.Context, msg *bridge.Message, room config.Room) {
+func (s *Service) settleCommand(ctx context.Context, msg *bridge.Message, room config.Room) {
 	notices := s.conf().Notices
-	if !notices.HasClearButton() {
+	mode := notices.CommandModeOr()
+	if mode == config.CommandsKeep {
 		return
 	}
 	// A command that took itself away (/clear) has nothing left to hang a
 	// button on: its row went with it.
 	if command, err := s.store.Command(ctx, msg.EventID.String()); err != nil || command == nil {
+		return
+	}
+	if mode == config.CommandsDelete {
+		// Forgotten first: the redaction comes back as an event, and a command
+		// still on record would take its answer with it (clearDeletedCommand).
+		if err := s.store.DeleteCommands(ctx, []string{msg.EventID.String()}); err != nil {
+			s.log.Debug().Err(err).Msg("Could not forget an answered command")
+			return
+		}
+		s.redactMine(ctx, msg.RoomID, room, msg.EventID, "an answered command")
 		return
 	}
 	sender := bridge.BotKey

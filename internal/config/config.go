@@ -585,16 +585,12 @@ type Notices struct {
 	// Reply sends a notice caused by a command as a reply to that command.
 	Reply *bool `yaml:"reply"`
 
-	// ClearButton puts a reaction on every command I type, which works as a
-	// delete button on the bridge's answer: tapping it adds the same reaction
-	// from me, and that is the signal to sweep the command and everything the
-	// bridge said in answer to it. It has to be done this way round because a
-	// bridge message cannot be reacted to at all — only my own can, and a
-	// reaction the bot already placed is one tap away. On by default; `/clear`
-	// does the same thing without a reaction, and deleting the command message
-	// itself takes the answer with it either way.
-	ClearButton *bool `yaml:"clear_button"`
-	// ClearEmoji is which reaction that is. A wastebasket by default, because
+	// Commands is what happens to a command I typed once the bridge has
+	// answered it: left alone (the default), given a delete button, or
+	// deleted. Either way `/clear` still works, and deleting the command
+	// message myself takes the answer with it.
+	Commands CommandMode `yaml:"commands"`
+	// ClearEmoji is which reaction the button is, with `commands: button`. A wastebasket by default, because
 	// the button has to say what it does with no label.
 	ClearEmoji string `yaml:"clear_emoji"`
 
@@ -606,8 +602,33 @@ type Notices struct {
 	FormatCommands bool `yaml:"format_commands"`
 }
 
-// HasClearButton defaults to true.
-func (n Notices) HasClearButton() bool { return n.ClearButton == nil || *n.ClearButton }
+// CommandMode is the three ways a command I typed can be tidied away.
+type CommandMode string
+
+const (
+	// CommandsKeep leaves the command where it is. The default.
+	CommandsKeep CommandMode = "keep"
+	// CommandsButton puts a reaction on the command, which works as a delete
+	// button on the bridge's answer: tapping it adds the same reaction from
+	// me, and that is the signal to sweep the command and everything the
+	// bridge said in answer to it. It has to be done this way round because a
+	// bridge message cannot be reacted to at all — only my own can, and a
+	// reaction the bot already placed is one tap away.
+	CommandsButton CommandMode = "button"
+	// CommandsDelete deletes the command once it has been answered and keeps
+	// the answer, which then is not a reply: it would quote a message that is
+	// gone. A command whose answer comes later (/btw, /summary) stays — it is
+	// the question, and carries the progress marker.
+	CommandsDelete CommandMode = "delete"
+)
+
+// CommandModeOr is Commands with the default applied.
+func (n Notices) CommandModeOr() CommandMode {
+	if n.Commands == "" {
+		return CommandsKeep
+	}
+	return n.Commands
+}
 
 // ClearKey is the reaction the button uses, wastebasket by default.
 const ClearKey = "🗑️"
@@ -624,7 +645,7 @@ func (n Notices) ClearEmojiOr() string {
 // pressed. Emoji reach the bridge with or without the variation selector
 // depending on the client, and the two are the same picture.
 func (n Notices) ClearTriggeredBy(key string) bool {
-	return n.HasClearButton() && sameEmoji(key, n.ClearEmojiOr())
+	return n.CommandModeOr() == CommandsButton && sameEmoji(key, n.ClearEmojiOr())
 }
 
 func sameEmoji(a, b string) bool {
@@ -632,8 +653,10 @@ func sameEmoji(a, b string) bool {
 }
 
 // RepliesToCommands defaults to true: a bridge answer belongs to the message
-// that asked for it.
-func (n Notices) RepliesToCommands() bool { return n.Reply == nil || *n.Reply }
+// that asked for it — unless that message is about to be deleted.
+func (n Notices) RepliesToCommands() bool {
+	return (n.Reply == nil || *n.Reply) && n.CommandModeOr() != CommandsDelete
+}
 
 // Questions is the ask_user path: a model that stops to ask something gets a
 // poll per question, and the answers resume the turn where it stopped.
@@ -886,6 +909,12 @@ func (c *Config) Validate() error {
 	case NoticeSenderBot, NoticeSenderGhost:
 	default:
 		return fmt.Errorf("notices.sender %q must be %s or %s", c.Notices.Sender, NoticeSenderBot, NoticeSenderGhost)
+	}
+	switch c.Notices.CommandModeOr() {
+	case CommandsKeep, CommandsButton, CommandsDelete:
+	default:
+		return fmt.Errorf("notices.commands %q must be %s, %s or %s",
+			c.Notices.Commands, CommandsKeep, CommandsButton, CommandsDelete)
 	}
 	switch c.Questions.Record() {
 	case AnswerReplace, AnswerKeep, AnswerDelete:

@@ -292,19 +292,29 @@ would be worse than a marker.
 
 That is what makes clearing up cheap. `/clear` removes the last bridge message
 and `/clear all` every one in the current conversation (`/clean` is an alias for
-both). There are two ways to do it without typing anything, and both exist
-because **a bridge message cannot be reacted to at all** — only your own can:
+both). `notices.commands` decides what happens to a command once it has been
+answered:
 
-- **the delete button.** The bot puts a 🗑️ on every command you type. Tapping
-  it sends the same reaction from you, which is the press: the command and
-  everything the bridge answered go together. The button goes with them.
+- **`keep`** (default): nothing, it stays until you clear it.
+- **`button`**: the delete button. The bot puts a 🗑️ on every command you type
+  — a reaction on *your* message, because **a bridge message cannot be reacted
+  to at all**. Tapping it sends the same reaction from you, which is the press:
+  the command and everything the bridge answered go together. The button goes
+  with them.
+- **`delete`**: the command is deleted as soon as it is answered and the answer
+  stays, not as a reply (it would quote a message that is gone). A command
+  whose answer comes later — `/btw`, `/summary` — stays: it is the question,
+  and it carries the progress marker.
+
+In every mode there is one more way, without typing anything:
+
 - **deleting the command message.** The question and the answer are one
   exchange, so removing the question removes the answer.
 
 ```yaml
 notices:
-  clear_button: true     # the bot's reaction on your commands
-  clear_emoji: "🗑️"      # which reaction that is
+  commands: keep         # keep, button or delete
+  clear_emoji: "🗑️"      # the button's reaction, with commands: button
   format_commands: true  # rewrite your `/command` as inline code
 ```
 

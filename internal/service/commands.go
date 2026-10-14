@@ -144,8 +144,8 @@ func (s *Service) handleCommand(ctx context.Context, msg *bridge.Message, room c
 	if reply != "" {
 		s.postNotice(ctx, msg, room, reply)
 		// Now that there is something to take back, the command gets the
-		// button that takes it.
-		s.addClearButton(ctx, msg, room)
+		// button that takes it, or goes.
+		s.settleCommand(ctx, msg, room)
 	}
 }
 

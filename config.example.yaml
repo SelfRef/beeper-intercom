@@ -269,15 +269,20 @@ notices:
   # A notice caused by a command is sent as a reply to it. Notices nobody asked
   # for (a toolset going idle) are never replies.
   reply: true
-  # The delete button. The bot puts one reaction on every command you type;
-  # tapping it sends the same reaction from you, and that pair — your command
-  # and everything the bridge answered — is removed. It works this way round
-  # because a bridge message cannot be reacted to at all, only your own can.
-  # Because the bridge hides the deletion tombstone, the exchange simply
-  # disappears. `/clear` does the same without the button, and deleting the
-  # command message yourself also takes the answer with it.
-  clear_button: true
-  # Which reaction the button is.
+  # What happens to a command you typed once the bridge has answered it:
+  #   keep    left alone (default);
+  #   button  the bot puts a reaction on it; tapping it sends the same reaction
+  #           from you, and that pair — your command and everything the bridge
+  #           answered — is removed. It works this way round because a bridge
+  #           message cannot be reacted to at all, only your own can;
+  #   delete  the command is deleted and the answer stays (not as a reply, it
+  #           would quote a message that is gone). A command whose answer comes
+  #           later (/btw, /summary) stays, it is the question.
+  # Because the bridge hides the deletion tombstone, a removed message simply
+  # disappears. `/clear` works in every mode, and deleting the command message
+  # yourself also takes the answer with it.
+  commands: keep
+  # Which reaction the button is, with `commands: button`.
   clear_emoji: "🗑️"
   # Rewrite a command you typed as inline code, so `/help` reads as a command
   # rather than as something you said. The bridge cannot edit someone else's

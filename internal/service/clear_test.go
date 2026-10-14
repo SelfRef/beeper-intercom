@@ -12,22 +12,22 @@ import (
 )
 
 // The delete button: the bot puts one reaction on my command, and only that
-// same reaction coming back from me is the press. On by default, because the
-// point is to be one tap rather than typing /clear.
+// same reaction coming back from me is the press. Only with commands: button.
 func TestClearTriggeredBy(t *testing.T) {
-	off := false
+	button := config.CommandsButton
 	for name, tc := range map[string]struct {
 		cfg  config.Notices
 		key  string
 		want bool
 	}{
-		"the default button":     {config.Notices{}, "🗑️", true},
-		"without its selector":   {config.Notices{}, "🗑", true},
-		"some other reaction":    {config.Notices{}, "👍", false},
-		"disabled":               {config.Notices{ClearButton: &off}, "🗑️", false},
-		"a configured button":    {config.Notices{ClearEmoji: "❌"}, "❌", true},
-		"not the configured one": {config.Notices{ClearEmoji: "❌"}, "🗑️", false},
-		"disabled beats a key":   {config.Notices{ClearButton: &off, ClearEmoji: "❌"}, "❌", false},
+		"the default button":     {config.Notices{Commands: button}, "🗑️", true},
+		"without its selector":   {config.Notices{Commands: button}, "🗑", true},
+		"some other reaction":    {config.Notices{Commands: button}, "👍", false},
+		"off by default":         {config.Notices{}, "🗑️", false},
+		"auto delete":            {config.Notices{Commands: config.CommandsDelete}, "🗑️", false},
+		"a configured button":    {config.Notices{Commands: button, ClearEmoji: "❌"}, "❌", true},
+		"not the configured one": {config.Notices{Commands: button, ClearEmoji: "❌"}, "🗑️", false},
+		"off beats a key":        {config.Notices{ClearEmoji: "❌"}, "❌", false},
 	} {
 		if got := tc.cfg.ClearTriggeredBy(tc.key); got != tc.want {
 			t.Errorf("%s: ClearTriggeredBy(%q) = %v, want %v", name, tc.key, got, tc.want)

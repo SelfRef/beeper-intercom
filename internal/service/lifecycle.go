@@ -83,7 +83,7 @@ func (s *Service) commandRestart(ctx context.Context, msg *bridge.Message, room 
 	// left to send it with. Posting it here rather than returning it is what
 	// makes that ordering certain.
 	s.postNotice(ctx, msg, room, colour(colourWarn, "Restarting")+" — back in a moment.")
-	s.addClearButton(ctx, msg, room)
+	s.settleCommand(ctx, msg, room)
 
 	ghostKey := ""
 	if len(room.Ghosts) > 0 {
