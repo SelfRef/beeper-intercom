@@ -168,30 +168,25 @@ func (s *Service) notice(ctx context.Context, roomID id.RoomID, ghostKey string,
 // postNoticeReply is the one place a bridge message is built: its own name and
 // avatar where the client understands them, an emoji and italics where it does
 // not, and a reply when something asked for it.
-func (s *Service) postNoticeReply(ctx context.Context, roomID id.RoomID, ghostKey string, thread, replyTo id.EventID, text string) {
+// It returns the notice's event, or "" when it could not be sent.
+func (s *Service) postNoticeReply(ctx context.Context, roomID id.RoomID, ghostKey string, thread, replyTo id.EventID, text string) id.EventID {
 	plain, formatted := s.renderNotice(text)
 	opts := bridge.SendOptions{Notice: true, ThreadRoot: thread, ReplyTo: replyTo}
-	// The bridge bot is what makes a notice look like the bridge: its m.notice
-	// renders as dim centred text with no bubble, in any room. A ghost's does
-	// not, so in ghost mode the per-message profile is the only thing left to
-	// tell the two voices apart.
-	sender := ghostKey
-	if s.conf().Notices.Sender == config.NoticeSenderBot {
-		sender = bridge.BotKey
-	} else {
+	sender := s.noticeSender(ghostKey)
+	if sender == ghostKey {
 		opts.Profile = s.noticeProfile(ctx)
 	}
 	eventID, err := s.bridge.SendText(ctx, roomID, sender, plain, formatted, opts)
 	if err != nil {
 		s.log.Warn().Err(err).Msg("Failed to post a notice")
-		return
+		return ""
 	}
 	// Remembered so it can be taken back: /clear, or a reaction on the command
 	// that caused it. A bridge message cannot be reacted to, so the command is
 	// the only handle the user has.
 	roomKey, known := s.bridge.RoomKey(roomID)
 	if !known {
-		return
+		return eventID
 	}
 	if err := s.store.PutNotice(ctx, &store.Notice{
 		EventID:      eventID.String(),
@@ -203,6 +198,18 @@ func (s *Service) postNoticeReply(ctx context.Context, roomID id.RoomID, ghostKe
 	}); err != nil {
 		s.log.Debug().Err(err).Msg("Could not record a notice")
 	}
+	return eventID
+}
+
+// noticeSender is who a notice is sent as. The bridge bot is what makes a
+// notice look like the bridge: its m.notice renders as dim centred text with
+// no bubble, in any room. A ghost's does not, so in ghost mode the
+// per-message profile is the only thing left to tell the two voices apart.
+func (s *Service) noticeSender(ghostKey string) string {
+	if s.conf().Notices.Sender == config.NoticeSenderBot {
+		return bridge.BotKey
+	}
+	return ghostKey
 }
 
 // renderNotice renders a bridge message. HTML is allowed here — unlike an
@@ -451,12 +458,38 @@ func (s *Service) commandModel(ctx context.Context, msg *bridge.Message, room co
 		if err := s.store.SetKV(ctx, kvModelOverride+msg.RoomKey, ""); err != nil {
 			return "Could not reset the model: " + err.Error()
 		}
+		if _, agentCfg, ok := s.agentConfigFor(ctx, room, msg.RoomKey); ok && s.switchLiveModel(ctx, msg, room, agentCfg.Model) {
+			return fmt.Sprintf("Model reset to the agent's default, `%s`, from the next message.", agentCfg.Model)
+		}
 		return "Model reset to the agent's default."
 	}
 	if err := s.store.SetKV(ctx, kvModelOverride+msg.RoomKey, model); err != nil {
 		return "Could not switch model: " + err.Error()
 	}
+	if s.switchLiveModel(ctx, msg, room, model) {
+		return fmt.Sprintf("Model for this room is now `%s`, from the next message.", model)
+	}
 	return fmt.Sprintf("Model for this room is now `%s`. It applies to the next conversation.", model)
+}
+
+// switchLiveModel moves the running conversation to another model when the
+// bridge holds its history: the transcript is replayed on every turn anyway,
+// so nothing ties it to the model that started it. A backend that keeps its
+// own history keeps its model until the next conversation.
+func (s *Service) switchLiveModel(ctx context.Context, msg *bridge.Message, room config.Room, model string) bool {
+	name, _, ok := s.agentConfigFor(ctx, room, msg.RoomKey)
+	if !ok {
+		return false
+	}
+	backend, built := s.agentFor(name)
+	if !built || backend.Caps().ServerHistory {
+		return false
+	}
+	live, err := s.store.LiveSession(ctx, msg.RoomKey, msg.ThreadRoot.String())
+	if err != nil || live == nil || live.Agent != name {
+		return false
+	}
+	return s.store.SetSessionModel(ctx, live.ID, model) == nil
 }
 
 // modelList asks the backend what it serves. A backend that cannot say so is

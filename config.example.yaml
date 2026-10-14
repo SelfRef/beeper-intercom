@@ -148,6 +148,22 @@ agents:
   #   max_history: 20
   #   system_prompt: You are a terse assistant answering from a chat app.
 
+  # The bridge runs the tool loop itself: an OpenAI-compatible endpoint plus
+  # MCP servers. Every call shows in the room; calls to a `confirm` server wait
+  # for Allow / Deny until a toolset naming it is switched on. README, "The
+  # tools adapter".
+  # ops:
+  #   type: tools
+  #   url: http://llama-swap:8080/v1
+  #   model: main
+  #   fallback: [other-box/main]
+  #   tool_ids: [ro, rw]
+  #   mcp:
+  #     ro: {url: "http://mcphub:3000/mcp/$smart/ops-ro", key_env: MCPHUB_KEY}
+  #     rw: {url: "http://mcphub:3000/mcp/$smart/ops-rw", key_env: MCPHUB_KEY, confirm: true, confirm_skip: "^(search_tools|describe_tool)$"}
+  #   toolsets:
+  #     rw: {description: Make changes without asking first, tools: [rw], idle: 15m}
+
   # External adapter protocol: POST /new, /turn, /cancel.
   # media:
   #   type: webhook

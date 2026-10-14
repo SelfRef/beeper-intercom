@@ -60,8 +60,7 @@ func (s *Service) resolveAsks(ctx context.Context, msg *bridge.Message, room con
 
 		// Status only: the answer to a question is posted as one message, so
 		// there is no stream to grow — but the phase still moves.
-		next, err := backend.Answer(ctx, conv, reply.Ask, answers,
-			agent.Sink{Status: func(state string) { marker.set(ctx, state) }})
+		next, err := backend.Answer(ctx, conv, reply.Ask, answers, marker.sink(ctx))
 		switch {
 		case err != nil:
 			s.postNotice(ctx, msg, room, "Could not deliver the answer: "+err.Error())

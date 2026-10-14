@@ -413,6 +413,78 @@ reply says so.
 | `openwebui` | Open WebUI: its tools, memory, RAG and compaction | server-side, one chat per conversation, visible and continuable in the web UI; streams by polling the chat while the turn runs as a background task |
 | `openai` | anything speaking `/v1/chat/completions` | the bridge keeps a transcript and replays a rolling window; streams over SSE |
 | `webhook` | a sidecar in any language | whatever the sidecar wants; streams if it answers with `text/event-stream` |
+| `tools` | the bridge runs the agent loop itself: any `/v1/chat/completions` endpoint plus MCP servers | the bridge keeps a transcript of the text, plus which tools each answer used; streams over SSE |
+
+#### The `tools` adapter
+
+A chat backend runs its tools out of sight. This adapter runs them in the bridge,
+so every step is visible in the room and the dangerous ones can wait for you:
+
+```yaml
+agents:
+  ops:
+    type: tools
+    url: http://llama-swap:8080/v1
+    model: qwen3:m
+    fallback: [big-box/qwen3-next:m]   # tried in order when a model fails
+    helper_model: helper               # the bridge's own requests (summaries)
+    transcribe_model: whisper          # voice messages; empty = refused
+    yield:                             # step off some models while a lock file exists
+      file: /locks/gpu
+      models: [qwen3]                  # matched without the ":m" suffix
+    system_prompt: You administer a home server from a chat app. Be brief.
+    tool_ids: [ro, rw]                 # always attached
+    mcp:
+      ro:
+        url: http://mcphub:3000/mcp/$smart/ops-ro
+        key_env: MCPHUB_KEY
+      rw:
+        url: http://mcphub:3000/mcp/$smart/ops-rw
+        key_env: MCPHUB_KEY
+        confirm: true                  # every call waits for Allow / Deny
+        confirm_skip: ^(search_tools|describe_tool)$
+    toolsets:
+      rw:
+        description: Make changes without asking first
+        tools: [rw]
+        idle: 15m
+```
+
+- **Tools are MCP servers** (streamable HTTP), connected for each turn. The key
+  in `mcp:` prefixes their tool names (`rw__call_tool`), so two hubs offering
+  the same tool stay apart. A server that cannot be reached costs its own
+  tools, not the answer.
+- **Every call is a line in the room.** One notice per turn lists the calls as
+  they run (`🔧 rw: sonarr_delete_series {"id":42}`) and stays as the record of
+  how the answer was reached. Fallbacks and unreachable servers show up there
+  too.
+- **`confirm: true`** makes every call to a server wait for an Allow / Deny
+  poll; `confirm_skip` exempts tools by name (the search half of a
+  search-then-call hub changes nothing). A toolset that names a server
+  attaches it **and trusts it** while it is on, so `/tools +rw` is "stop
+  asking", not "allow writes": the writes were always there, behind a question.
+- **The model can ask you** a multiple-choice question with its `ask_user`
+  tool; it arrives as a poll and the answer resumes the turn. A question nobody
+  answers ends the turn without running anything. Open questions live in
+  memory: a restart forgets them.
+- **Fallback.** A model that fails before it has said anything — unreachable,
+  an HTTP error, a model that will not load — hands the request to the next
+  one in `fallback`, which then stays first for the rest of the turn. Half an
+  answer is never handed over.
+- **Yield.** While `yield.file` exists, the models in `yield.models` are taken
+  out of the order (as long as something is left), and the room is told why.
+  The file may say `reason=<text>` (shown) and `until=<unix seconds>` (past
+  that it is stale and ignored). The use: a benchmark holds a lock on the GPU
+  the main model lives on, and the agent answers from another box instead of
+  evicting the model under test.
+- **History** between turns is the text only, plus a line naming the tools the
+  answer used. Tool results are stale by the next question and replaying them
+  is what makes a long conversation slow; the model calls again if it needs
+  to. Within a turn it gets 12 rounds of tool calls (then one last answer
+  without tools), and each tool result is cut at 16 000 characters.
+- **`/model`** switches the running conversation, not just the next one: the
+  transcript is replayed on every turn, so nothing ties it to the model that
+  started it. The same holds for the `openai` adapter.
 
 **The webhook contract**, so you can write your own:
 

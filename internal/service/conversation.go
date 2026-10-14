@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,49 @@ type progressMarker struct {
 	phase   string
 	emoji   string
 	eventID id.EventID
+
+	// The activity notice: one bridge message per turn listing what the
+	// backend reported doing (tool calls, fallbacks), edited as lines arrive
+	// and left in place as the record of how the answer was reached.
+	thread   id.EventID
+	actMu    sync.Mutex
+	activity []string
+	actEvent id.EventID
+}
+
+// activityLines caps the notice: a long tool loop keeps its latest steps.
+const activityLines = 12
+
+// note adds a line to the activity notice.
+func (m *progressMarker) note(ctx context.Context, line string) {
+	if m == nil {
+		return
+	}
+	m.actMu.Lock()
+	defer m.actMu.Unlock()
+	// Lines carry tool arguments and error bodies, and a notice passes HTML
+	// through, so they are escaped here.
+	m.activity = append(m.activity, html.EscapeString(line))
+	if len(m.activity) > activityLines {
+		m.activity = append([]string{"…"}, m.activity[len(m.activity)-activityLines+1:]...)
+	}
+	text := strings.Join(m.activity, "\n")
+	if m.actEvent == "" {
+		m.actEvent = m.s.postNoticeReply(ctx, m.roomID, m.ghostKey, m.thread, "", text)
+		return
+	}
+	plain, formatted := m.s.renderNotice(text)
+	if _, err := m.s.bridge.SendNoticeEdit(ctx, m.roomID, m.s.noticeSender(m.ghostKey), m.actEvent, plain, formatted); err != nil {
+		m.s.log.Debug().Err(err).Msg("Could not update the activity notice")
+	}
+}
+
+// sink is what a backend reports progress to.
+func (m *progressMarker) sink(ctx context.Context) agent.Sink {
+	return agent.Sink{
+		Status:   func(state string) { m.set(ctx, state) },
+		Activity: func(line string) { m.note(ctx, line) },
+	}
 }
 
 func (s *Service) newProgress(roomID id.RoomID, ghostKey string, target id.EventID) *progressMarker {
@@ -186,6 +230,7 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 	// disappears when the answer lands. It also says which phase the turn is
 	// in, so a long wait is legible: queued, thinking, searching, writing.
 	marker := s.newProgress(roomID, ghostKey, msg.EventID)
+	marker.thread = msg.ThreadRoot
 	marker.set(ctx, "queued")
 	defer marker.clear(ctx)
 
@@ -211,7 +256,7 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 	var stream *bridge.Stream
 	var streamMu sync.Mutex
 	streamFailed := false
-	sink := agent.Sink{Status: func(state string) { marker.set(ctx, state) }}
+	sink := marker.sink(ctx)
 	if backend.Caps().Streaming && progress.Mode != config.ProgressOff {
 		sink.Delta = func(text string) {
 			streamMu.Lock()

@@ -163,13 +163,23 @@ func (b *Bridge) sendText(ctx context.Context, roomID id.RoomID, ghostKey, body,
 // SendEdit replaces an earlier message in place, which is how a streamed or
 // split answer is finalised without a second bubble.
 func (b *Bridge) SendEdit(ctx context.Context, roomID id.RoomID, ghostKey string, target id.EventID, body, formatted string) (id.EventID, error) {
-	newContent := &event.MessageEventContent{MsgType: event.MsgText, Body: body}
+	return b.sendEdit(ctx, roomID, ghostKey, target, event.MsgText, body, formatted)
+}
+
+// SendNoticeEdit is SendEdit for a notice, which has to stay a notice: the
+// replacement content carries its own msgtype.
+func (b *Bridge) SendNoticeEdit(ctx context.Context, roomID id.RoomID, ghostKey string, target id.EventID, body, formatted string) (id.EventID, error) {
+	return b.sendEdit(ctx, roomID, ghostKey, target, event.MsgNotice, body, formatted)
+}
+
+func (b *Bridge) sendEdit(ctx context.Context, roomID id.RoomID, ghostKey string, target id.EventID, msgType event.MessageType, body, formatted string) (id.EventID, error) {
+	newContent := &event.MessageEventContent{MsgType: msgType, Body: body}
 	if formatted != "" && formatted != body {
 		newContent.Format = event.FormatHTML
 		newContent.FormattedBody = formatted
 	}
 	content := &event.MessageEventContent{
-		MsgType:    event.MsgText,
+		MsgType:    msgType,
 		Body:       "* " + body,
 		NewContent: newContent,
 		RelatesTo:  &event.RelatesTo{Type: event.RelReplace, EventID: target},

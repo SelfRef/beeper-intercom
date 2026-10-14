@@ -125,6 +125,17 @@ type Sink struct {
 	// deltas is the answer as the model produced it; the Reply returned by Send
 	// is authoritative if the two ever differ.
 	Delta func(text string)
+	// Activity is a line for the human about what the turn is doing that is
+	// not part of the answer: a tool being called, a model that failed and
+	// handed over to the next one.
+	Activity func(line string)
+}
+
+// Note reports activity if anybody is listening.
+func (s Sink) Note(line string) {
+	if s.Activity != nil && line != "" {
+		s.Activity(line)
+	}
 }
 
 // Push delivers generated text if anybody is listening.
@@ -201,6 +212,8 @@ func New(name string, cfg config.Agent, st *store.Store, log zerolog.Logger) (Ag
 		return newOpenAI(cfg, client, st, log), nil
 	case config.AgentWebhook:
 		return newWebhook(cfg, client, log), nil
+	case config.AgentTools:
+		return newTools(cfg, client, st, log), nil
 	default:
 		return nil, fmt.Errorf("unknown agent type %q", cfg.Type)
 	}

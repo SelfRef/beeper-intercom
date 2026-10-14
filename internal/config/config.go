@@ -148,6 +148,7 @@ const (
 	AgentOpenWebUI = "openwebui"
 	AgentOpenAI    = "openai"
 	AgentWebhook   = "webhook"
+	AgentTools     = "tools"
 )
 
 // Agent is one conversational backend. The bridge owns session policy,
@@ -202,6 +203,24 @@ type Agent struct {
 	SystemPrompt string `yaml:"system_prompt"`
 	MaxHistory   int    `yaml:"max_history"`
 
+	// tools: the bridge runs the agent loop itself, against an
+	// OpenAI-compatible endpoint (url, model) and the MCP servers below.
+	// ToolIDs and every toolset's Tools name keys of MCP: the first are always
+	// attached, a toolset attaches its servers AND lifts their confirmation
+	// while it is on.
+	MCP map[string]MCPServer `yaml:"mcp"`
+	// Fallback models are tried in order when the model fails before it has
+	// said anything: unreachable, an HTTP error, a model that will not load.
+	Fallback []string `yaml:"fallback"`
+	// HelperModel answers the bridge's own requests (the summary carried into
+	// the next conversation). Empty means the conversation's model.
+	HelperModel string `yaml:"helper_model"`
+	// TranscribeModel is sent to /audio/transcriptions for voice messages.
+	// Empty means voice messages are refused.
+	TranscribeModel string `yaml:"transcribe_model"`
+	// Yield steps off some models while a lock file exists, see Yield.
+	Yield Yield `yaml:"yield"`
+
 	// webhook: extra headers for the sidecar, e.g. a shared secret.
 	Headers map[string]string `yaml:"headers"`
 
@@ -230,6 +249,46 @@ type Toolset struct {
 	// Only meaningful for a toolset that is off by default: the point is that
 	// an escalation closes itself when the reason for it has passed.
 	Idle Duration `yaml:"idle"`
+}
+
+// MCPServer is one MCP endpoint (streamable HTTP) for a tools agent. Its key
+// in the map prefixes the tool names the model sees: "rw__call_tool".
+type MCPServer struct {
+	URL string `yaml:"url"`
+	// KeyEnv names the variable with a bearer token; Headers are sent as is.
+	KeyEnv  string            `yaml:"key_env"`
+	Headers map[string]string `yaml:"headers"`
+	// Confirm makes every call to this server wait for a yes in the room,
+	// unless a toolset naming the server is on. ConfirmSkip is a regexp of
+	// tool names (without the prefix) exempt from that — the search half of
+	// a search-then-call hub, which changes nothing.
+	Confirm     bool   `yaml:"confirm"`
+	ConfirmSkip string `yaml:"confirm_skip"`
+}
+
+// AllHeaders are the headers to send, the bearer token included.
+func (m MCPServer) AllHeaders() map[string]string {
+	out := make(map[string]string, len(m.Headers)+1)
+	for k, v := range m.Headers {
+		out[k] = v
+	}
+	if m.KeyEnv != "" {
+		if key := os.Getenv(m.KeyEnv); key != "" {
+			out["Authorization"] = "Bearer " + key
+		}
+	}
+	return out
+}
+
+// Yield takes models out of a tools agent's list while File exists — e.g. a
+// lock a benchmark holds on the GPU those models run on — so the turn goes to
+// the next model instead of evicting whatever the GPU is busy with. The file
+// may carry `until=<unix seconds>` (past that it is ignored as stale) and
+// `reason=<text>` (shown in the room).
+type Yield struct {
+	File string `yaml:"file"`
+	// Models are matched without a ":" suffix, so "qwen38" covers qwen38:m.
+	Models []string `yaml:"models"`
 }
 
 // Session is when a conversation stops being the same conversation.
@@ -890,6 +949,10 @@ func (c *Config) Validate() error {
 		agent := c.Agents[key]
 		switch agent.Type {
 		case AgentOpenWebUI, AgentOpenAI, AgentWebhook:
+		case AgentTools:
+			if err := agent.validateTools(); err != nil {
+				return fmt.Errorf("agent %q: %w", key, err)
+			}
 		default:
 			return fmt.Errorf("agent %q: unknown type %q", key, agent.Type)
 		}
@@ -950,6 +1013,36 @@ func (c *Config) AdminToken() string {
 		return v
 	}
 	return c.Server.AdminToken
+}
+
+// validateTools checks what only a tools agent has: every tool id names an
+// MCP server, and every skip pattern compiles.
+func (a Agent) validateTools() error {
+	for _, name := range SortedKeys(a.MCP) {
+		server := a.MCP[name]
+		if !keyRe.MatchString(name) {
+			return fmt.Errorf("mcp server %q must match %s (it prefixes tool names)", name, keyRe)
+		}
+		if server.URL == "" {
+			return fmt.Errorf("mcp server %q has no url", name)
+		}
+		if _, err := regexp.Compile(server.ConfirmSkip); err != nil {
+			return fmt.Errorf("mcp server %q: confirm_skip: %w", name, err)
+		}
+	}
+	ids := append([]string{}, a.ToolIDs...)
+	for _, set := range a.Toolsets {
+		ids = append(ids, set.Tools...)
+	}
+	for _, id := range ids {
+		if _, ok := a.MCP[id]; !ok {
+			return fmt.Errorf("tool %q is not one of the mcp servers", id)
+		}
+	}
+	if a.Yield.File != "" && len(a.Yield.Models) == 0 {
+		return fmt.Errorf("yield has a file but no models")
+	}
+	return nil
 }
 
 // Key returns the API key for an agent, environment first.
