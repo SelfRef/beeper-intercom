@@ -37,8 +37,10 @@ type Config struct {
 	Notices Notices `yaml:"notices"`
 	// Questions is what happens when the model asks ME something.
 	Questions Questions `yaml:"questions"`
-	Log       Log       `yaml:"log"`
-	Limits    Limits    `yaml:"limits"`
+	// Watch is where rooms with `watch: true` report their events.
+	Watch  Watch  `yaml:"watch"`
+	Log    Log    `yaml:"log"`
+	Limits Limits `yaml:"limits"`
 
 	// Dir is the directory the config was loaded from; relative paths in the
 	// file (avatars, mostly) resolve against it.
@@ -141,6 +143,26 @@ type Room struct {
 	ActionsWebhook string `yaml:"actions_webhook"`
 	// Invite are extra user IDs to invite besides the account owner.
 	Invite []string `yaml:"invite"`
+	// Watch reports every message, edit, reaction and deletion in this room —
+	// mine and the ghosts' — to the `watch` endpoint, in the event format of
+	// beeper-watch's bridge hook. It makes a room a test bed for rules written
+	// against bridged chats.
+	Watch bool `yaml:"watch"`
+}
+
+// Watch is an event hook in beeper-watch's ingest format (POST, one JSON
+// object per event, schema 1).
+type Watch struct {
+	URL      string `yaml:"url"`
+	TokenEnv string `yaml:"token_env"`
+}
+
+// Token is the bearer token for the hook, if any.
+func (w Watch) Token() string {
+	if w.TokenEnv == "" {
+		return ""
+	}
+	return os.Getenv(w.TokenEnv)
 }
 
 // Agent types.
@@ -938,6 +960,9 @@ func (c *Config) Validate() error {
 			if tag != "favourite" && tag != "lowpriority" {
 				return fmt.Errorf("room %q: unknown tag %q (favourite or lowpriority)", key, tag)
 			}
+		}
+		if room.Watch && c.Watch.URL == "" {
+			return fmt.Errorf("room %q has watch on but there is no watch.url", key)
 		}
 		if room.Agent != "" {
 			if _, ok := c.Agents[room.Agent]; !ok {

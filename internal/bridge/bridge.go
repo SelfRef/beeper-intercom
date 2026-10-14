@@ -54,6 +54,10 @@ type Handlers struct {
 	OnRedaction func(ctx context.Context, roomKey string, roomID id.RoomID, target id.EventID)
 	// PollResponse is an answer to a poll the bridge asked.
 	OnPollResponse func(ctx context.Context, evt *PollResponse)
+	// RoomEvent is every message, reaction and redaction in a known room that
+	// reaches the appservice, raw and before any filtering — for observers
+	// that want the events themselves rather than what they mean.
+	OnRoomEvent func(ctx context.Context, roomKey string, evt *event.Event)
 }
 
 // Message is one inbound message from the account owner.

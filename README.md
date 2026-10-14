@@ -557,6 +557,37 @@ Deliveries go through an outbox: the row exists before the HTTP call, so an
 action survives the receiver being restarted. `GET /v1/deliveries` and
 `POST /v1/deliveries/{id}/retry` are there when one does not.
 
+## Watching a room's events
+
+A room with `watch: true` reports every message, edit, reaction and deletion
+in it — mine and the ghosts' — to an event hook, in the format
+[beeper-watch](https://github.com/SelfRef/beeper-watch) takes from its patched
+mautrix bridges: one JSON object per event (`schema: 1`, `network`, `bridge`,
+`direction`, `kind`, `room_id`, `event_id`, `sender`, `is_self`, `body`, …).
+The network and bridge are this bridge's own (`network.id`,
+`network.bridge`), so a rule scoped to them never fires on a real chat.
+
+```yaml
+watch:
+  url: http://beeper-watch:8080/v1/events
+  token_env: WATCH_INGEST_TOKEN
+
+rooms:
+  test:
+    name: Test
+    kind: dm
+    ghosts: [tester]
+    watch: true
+```
+
+The point is a test bed: a room you fully control, where "send a message to
+Tester" and "a message arrived from Tester" can be produced on demand, against
+the same rules, delivery and MCP tools as a bridged chat. Your side arrives
+through the appservice as raw events; a ghost's side is reported where the
+bridge posts it (a notification, an agent's answer), because an appservice is
+never sent its own ghosts' events. Reporting is fire-and-forget like the
+bridges' hook — no retry, the receiver dedupes by event ID.
+
 ## The status room
 
 Name one with `network.status_room` and the bridge creates a bridge-bot room

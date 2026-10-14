@@ -347,6 +347,7 @@ func (s *Service) handleTurn(ctx context.Context, msg *bridge.Message, room conf
 		s.reportFailure(ctx, msg, err)
 		return
 	}
+	s.reportPosted(msg.RoomKey, roomID, replyEvent, ghostKey, reply.Text)
 
 	if reply.Parent != "" {
 		parent = reply.Parent

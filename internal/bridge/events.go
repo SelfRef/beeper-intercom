@@ -16,6 +16,7 @@ func (b *Bridge) handleMessage(ctx context.Context, evt *event.Event) {
 	if !ok || b.IsOwnGhost(evt.Sender) {
 		return
 	}
+	b.observe(ctx, roomKey, evt)
 	content, ok := evt.Content.Parsed.(*event.MessageEventContent)
 	if !ok || content == nil {
 		return
@@ -87,7 +88,11 @@ func (b *Bridge) handleMessage(ctx context.Context, evt *event.Event) {
 
 func (b *Bridge) handleReaction(ctx context.Context, evt *event.Event) {
 	roomKey, ok := b.RoomKey(evt.RoomID)
-	if !ok || b.IsOwnGhost(evt.Sender) || b.handlers.OnReaction == nil {
+	if !ok || b.IsOwnGhost(evt.Sender) {
+		return
+	}
+	b.observe(ctx, roomKey, evt)
+	if b.handlers.OnReaction == nil {
 		return
 	}
 	content, ok := evt.Content.Parsed.(*event.ReactionEventContent)
@@ -106,7 +111,11 @@ func (b *Bridge) handleReaction(ctx context.Context, evt *event.Event) {
 
 func (b *Bridge) handleRedaction(ctx context.Context, evt *event.Event) {
 	roomKey, ok := b.RoomKey(evt.RoomID)
-	if !ok || b.IsOwnGhost(evt.Sender) || b.handlers.OnRedaction == nil {
+	if !ok || b.IsOwnGhost(evt.Sender) {
+		return
+	}
+	b.observe(ctx, roomKey, evt)
+	if b.handlers.OnRedaction == nil {
 		return
 	}
 	target := evt.Redacts
@@ -119,6 +128,13 @@ func (b *Bridge) handleRedaction(ctx context.Context, evt *event.Event) {
 		return
 	}
 	b.handlers.OnRedaction(ctx, roomKey, evt.RoomID, target)
+}
+
+// observe hands the raw event to OnRoomEvent, if anybody is listening.
+func (b *Bridge) observe(ctx context.Context, roomKey string, evt *event.Event) {
+	if b.handlers.OnRoomEvent != nil {
+		b.handlers.OnRoomEvent(ctx, roomKey, evt)
+	}
 }
 
 // handlePollResponse parses the MSC3381 answer. mautrix has no typed struct

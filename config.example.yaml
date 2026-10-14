@@ -195,6 +195,12 @@ sources:
         # Drop anything below ntfy priority 3 instead of mirroring it.
         min_priority: 3
 
+# Rooms with `watch: true` report every event to this hook, in beeper-watch's
+# bridge-hook format (README, "Watching a room's events").
+# watch:
+#   url: http://beeper-watch:8080/v1/events
+#   token_env: WATCH_INGEST_TOKEN
+
 # Where reactions and poll answers are reported. The receiver decides what an
 # action means; the bridge only knows that one was declared.
 actions:

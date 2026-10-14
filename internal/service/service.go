@@ -113,6 +113,7 @@ func New(cfg *config.Config, configPath string, st *store.Store, log zerolog.Log
 		OnReaction:     s.onReaction,
 		OnRedaction:    s.onRedaction,
 		OnPollResponse: s.onPollResponse,
+		OnRoomEvent:    s.onRoomEvent,
 	})
 	return s, nil
 }
@@ -338,6 +339,7 @@ func (s *Service) deliver(ctx context.Context, n *notify.Notification) (id.Event
 	}
 
 	roomID, _ := s.bridge.RoomID(roomKey)
+	s.reportPosted(roomKey, roomID, eventID, ghostKey, strings.TrimSpace(n.Title+"\n"+n.Text))
 	record := &store.Notification{
 		EventID:    eventID.String(),
 		RoomKey:    roomKey,
